@@ -52,15 +52,16 @@ if 'current_prompt' not in st.session_state:
     st.session_state.current_prompt = DEFAULT_PROMPT
 
 if 'saved_prompts' not in st.session_state:
+    # Initialize with default
+    st.session_state.saved_prompts = {"Default": DEFAULT_PROMPT}
     # Try to load from Supabase on first run
     try:
         db_prompts = st.session_state.supabase_client.get_all_prompts()
         if db_prompts:
-            st.session_state.saved_prompts = {p['name']: p['prompt_text'] for p in db_prompts}
-        else:
-            st.session_state.saved_prompts = {"Default": DEFAULT_PROMPT}
-    except:
-        st.session_state.saved_prompts = {"Default": DEFAULT_PROMPT}
+            for p in db_prompts:
+                st.session_state.saved_prompts[p['name']] = p['prompt_text']
+    except Exception as e:
+        st.sidebar.error(f"Error loading prompts: {e}")
 
 
 def get_merged_chunks(query: str, project_id: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
@@ -307,6 +308,8 @@ def show_single_requirement_tab(project_id: str, top_k: int):
         st.markdown("### Quick Actions")
         if st.button("🔄 Reset to Default", use_container_width=True):
             st.session_state.current_prompt = DEFAULT_PROMPT
+            if "prompt_editor" in st.session_state:
+                st.session_state.prompt_editor = DEFAULT_PROMPT
             st.rerun()
         
         if st.button("📋 Copy Prompt", use_container_width=True):
@@ -516,6 +519,8 @@ def show_csv_batch_tab(project_id: str, top_k: int):
         st.markdown("### Quick Actions")
         if st.button("🔄 Reset to Default", key="reset_batch", use_container_width=True):
             st.session_state.current_prompt = DEFAULT_PROMPT
+            if "batch_prompt_editor" in st.session_state:
+                st.session_state.batch_prompt_editor = DEFAULT_PROMPT
             st.rerun()
         
         st.markdown("---")
