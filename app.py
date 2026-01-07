@@ -288,6 +288,11 @@ def show_single_requirement_tab(project_id: str, top_k: int):
     st.header("Single Requirement Testing")
     st.markdown("Enter a requirement and customize the prompt to see the AI's analysis.")
     
+    # Callback for reset
+    def reset_single():
+        st.session_state.current_prompt = DEFAULT_PROMPT
+        st.session_state.prompt_editor = DEFAULT_PROMPT
+
     # Prompt editor with enhanced UI
     st.subheader("📝 Prompt Template Editor")
     
@@ -306,10 +311,7 @@ def show_single_requirement_tab(project_id: str, top_k: int):
     
     with col2:
         st.markdown("### Quick Actions")
-        if st.button("🔄 Reset to Default", use_container_width=True):
-            st.session_state.current_prompt = DEFAULT_PROMPT
-            if "prompt_editor" in st.session_state:
-                st.session_state.prompt_editor = DEFAULT_PROMPT
+        if st.button("🔄 Reset to Default", use_container_width=True, on_click=reset_single):
             st.rerun()
         
         if st.button("📋 Copy Prompt", use_container_width=True):
@@ -499,6 +501,11 @@ def show_csv_batch_tab(project_id: str, top_k: int):
             for val in sample_values:
                 st.caption(f"- {str(val)[:100]}...")
     
+    # Callback for reset
+    def reset_batch():
+        st.session_state.current_prompt = DEFAULT_PROMPT
+        st.session_state.batch_prompt_editor = DEFAULT_PROMPT
+
     # Prompt editor for batch processing with enhanced UI
     st.markdown("---")
     st.subheader("📝 Prompt Template Editor")
@@ -517,10 +524,7 @@ def show_csv_batch_tab(project_id: str, top_k: int):
     
     with col2:
         st.markdown("### Quick Actions")
-        if st.button("🔄 Reset to Default", key="reset_batch", use_container_width=True):
-            st.session_state.current_prompt = DEFAULT_PROMPT
-            if "batch_prompt_editor" in st.session_state:
-                st.session_state.batch_prompt_editor = DEFAULT_PROMPT
+        if st.button("🔄 Reset to Default", key="reset_batch", use_container_width=True, on_click=reset_batch):
             st.rerun()
         
         st.markdown("---")
