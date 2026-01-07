@@ -293,6 +293,13 @@ def show_single_requirement_tab(project_id: str, top_k: int):
         st.session_state.current_prompt = DEFAULT_PROMPT
         st.session_state.prompt_editor = DEFAULT_PROMPT
 
+    # Callback for load
+    def load_single():
+        if "prompt_to_load" in st.session_state:
+            selected = st.session_state.prompt_to_load
+            st.session_state.current_prompt = st.session_state.saved_prompts[selected]
+            st.session_state.prompt_editor = st.session_state.saved_prompts[selected]
+
     # Prompt editor with enhanced UI
     st.subheader("📝 Prompt Template Editor")
     
@@ -323,9 +330,8 @@ def show_single_requirement_tab(project_id: str, top_k: int):
         
         # Load logic
         prompt_names = list(st.session_state.saved_prompts.keys())
-        selected_to_load = st.selectbox("📂 Load Saved Prompt", options=prompt_names, index=0)
-        if st.button("📂 Load Selected", use_container_width=True):
-            st.session_state.current_prompt = st.session_state.saved_prompts[selected_to_load]
+        st.selectbox("📂 Load Saved Prompt", options=prompt_names, index=0, key="prompt_to_load")
+        if st.button("📂 Load Selected", use_container_width=True, on_click=load_single):
             st.rerun()
 
         # Save logic
@@ -506,6 +512,13 @@ def show_csv_batch_tab(project_id: str, top_k: int):
         st.session_state.current_prompt = DEFAULT_PROMPT
         st.session_state.batch_prompt_editor = DEFAULT_PROMPT
 
+    # Callback for load
+    def load_batch():
+        if "batch_prompt_to_load" in st.session_state:
+            selected = st.session_state.batch_prompt_to_load
+            st.session_state.current_prompt = st.session_state.saved_prompts[selected]
+            st.session_state.batch_prompt_editor = st.session_state.saved_prompts[selected]
+
     # Prompt editor for batch processing with enhanced UI
     st.markdown("---")
     st.subheader("📝 Prompt Template Editor")
@@ -527,6 +540,15 @@ def show_csv_batch_tab(project_id: str, top_k: int):
         if st.button("🔄 Reset to Default", key="reset_batch", use_container_width=True, on_click=reset_batch):
             st.rerun()
         
+        st.markdown("---")
+        st.markdown("### 💾 Manage Prompts")
+        
+        # Load logic
+        prompt_names = list(st.session_state.saved_prompts.keys())
+        st.selectbox("📂 Load Saved Prompt", options=prompt_names, index=0, key="batch_prompt_to_load")
+        if st.button("📂 Load Selected", key="load_batch_btn", use_container_width=True, on_click=load_batch):
+            st.rerun()
+
         st.markdown("---")
         st.markdown("### Placeholders")
         st.markdown("""
