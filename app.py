@@ -51,6 +51,17 @@ if 'ai_client' not in st.session_state:
 if 'current_prompt' not in st.session_state:
     st.session_state.current_prompt = DEFAULT_PROMPT
 
+if 'saved_prompts' not in st.session_state:
+    # Try to load from Supabase on first run
+    try:
+        db_prompts = st.session_state.supabase_client.get_all_prompts()
+        if db_prompts:
+            st.session_state.saved_prompts = {p['name']: p['prompt_text'] for p in db_prompts}
+        else:
+            st.session_state.saved_prompts = {"Default": DEFAULT_PROMPT}
+    except:
+        st.session_state.saved_prompts = {"Default": DEFAULT_PROMPT}
+
 
 def get_merged_chunks(query: str, project_id: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
     """Get merged chunks using RAG search. Returns (merged_text, chunks_metadata)."""
@@ -85,7 +96,16 @@ def process_requirement(
     """Process a single requirement using RAG and AI. Returns (result, chunks_metadata)."""
     # Get chunks using RAG
     document_chunks_text, chunks_metadata = get_merged_chunks(requirement, project_id, top_k)
-    
+    return process_requirement_with_chunks(requirement, document_chunks_text, chunks_metadata, prompt_template)
+
+
+def process_requirement_with_chunks(
+    requirement: str,
+    document_chunks_text: str,
+    chunks_metadata: List[Dict[str, Any]],
+    prompt_template: str
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Helper to process requirement with pre-fetched chunks."""
     if not document_chunks_text:
         return {
             "status": "NOT_FULFILLED",
@@ -151,8 +171,9 @@ def enrich_citation_with_doc_info(citation: Dict[str, Any], chunks_metadata: Lis
     return citation_copy
 
 
-def display_result(result: Dict[str, Any], requirement: str, chunks_metadata: List[Dict[str, Any]] = None):
+def display_result(result: Dict[str, Any], requirement: str, chunks_metadata: List[Dict[str, Any]] = None, key_suffix: str = ""):
     """Display a single requirement result."""
+    # ... (status badge code) ...
     # Status badge
     status = result.get("status", "UNKNOWN")
     if status == "FULFILLED":
@@ -213,7 +234,7 @@ def display_result(result: Dict[str, Any], requirement: str, chunks_metadata: Li
             data=result_json,
             file_name="requirement_result.json",
             mime="application/json",
-            key="json_download_from_view"
+            key=f"json_download_from_view_{key_suffix}"
         )
 
 
@@ -286,6 +307,35 @@ def show_single_requirement_tab(project_id: str, top_k: int):
             st.success("Prompt copied! Use Ctrl+C to copy from above.")
         
         st.markdown("---")
+        st.markdown("### 💾 Manage Prompts")
+        
+        # Load logic
+        prompt_names = list(st.session_state.saved_prompts.keys())
+        selected_to_load = st.selectbox("📂 Load Saved Prompt", options=prompt_names, index=0)
+        if st.button("📂 Load Selected", use_container_width=True):
+            st.session_state.current_prompt = st.session_state.saved_prompts[selected_to_load]
+            st.rerun()
+
+        # Save logic
+        new_prompt_name = st.text_input("New Prompt Name", placeholder="e.g., Reasoning V2")
+        if st.button("💾 Save Current", use_container_width=True):
+            if new_prompt_name:
+                # Save to Supabase
+                success = st.session_state.supabase_client.save_prompt(
+                    name=new_prompt_name, 
+                    prompt_text=prompt_template,
+                    project_id=project_id if project_id else None
+                )
+                if success:
+                    st.session_state.saved_prompts[new_prompt_name] = prompt_template
+                    st.success(f"Saved to database!")
+                    st.rerun()
+                else:
+                    st.error("Failed to save to database.")
+            else:
+                st.error("Enter a name")
+
+        st.markdown("---")
         st.markdown("### Placeholders")
         st.markdown("""
         <div style='background-color: #e8f4f8; padding: 10px; border-radius: 5px; margin: 10px 0;'>
@@ -316,47 +366,82 @@ def show_single_requirement_tab(project_id: str, top_k: int):
     st.markdown("---")
     
     # Requirement input
-    st.subheader("Requirement Input")
+    st.subheader("Requirement Input & Testing")
+    
+    # Comparison Mode
+    prompts_to_compare = st.multiselect(
+        "⚖️ Select Saved Prompts to Compare",
+        options=list(st.session_state.saved_prompts.keys()),
+        default=[],
+        help="Select multiple prompts to see results side-by-side. If empty, only current prompt will run."
+    )
+
     requirement_text = st.text_area(
         "Enter Requirement",
-        height=150,
+        height=100,
         help="Enter the requirement to verify against the documents",
         key="single_requirement_input"
     )
     
-    if st.button("Process Requirement", type="primary", key="process_single"):
+    if st.button("🚀 Process Requirement", type="primary", key="process_single"):
         if not requirement_text:
             st.warning("Please enter a requirement first.")
             return
         
-        with st.spinner("Processing requirement using RAG and AI..."):
-            result, chunks_metadata = process_requirement(
-                requirement=requirement_text,
-                project_id=project_id,
-                prompt_template=prompt_template,
-                top_k=top_k
+        # Decide which prompts to run
+        if prompts_to_compare:
+            # Run comparison
+            active_prompts = { name: st.session_state.saved_prompts[name] for name in prompts_to_compare }
+            
+            with st.spinner(f"Comparing {len(active_prompts)} prompts..."):
+                document_chunks_text, chunks_metadata = get_merged_chunks(requirement_text, project_id, top_k)
+                if not document_chunks_text:
+                    st.error("No relevant documents found.")
+                    return
+                
+                # Side-by-side columns
+                cols = st.columns(len(active_prompts))
+                for i, (name, template) in enumerate(active_prompts.items()):
+                    with cols[i]:
+                        st.markdown(f"#### Prompt: {name}")
+                        result, _ = process_requirement_with_chunks(
+                            requirement=requirement_text,
+                            document_chunks_text=document_chunks_text,
+                            chunks_metadata=chunks_metadata,
+                            prompt_template=template
+                        )
+                        display_result(result, requirement_text, chunks_metadata, key_suffix=f"comp_{i}")
+        else:
+            # Run single (current) prompt
+            with st.spinner("Processing requirement..."):
+                result, chunks_metadata = process_requirement(
+                    requirement=requirement_text,
+                    project_id=project_id,
+                    prompt_template=prompt_template,
+                    top_k=top_k
+                )
+            
+            st.markdown("---")
+            st.subheader("Results")
+            display_result(result, requirement_text, chunks_metadata, key_suffix="single")
+            
+            # Download result with enriched citations
+            enriched_result = result.copy()
+            if chunks_metadata and result.get("citations"):
+                enriched_citations = []
+                for citation in result.get("citations", []):
+                    enriched_citation = enrich_citation_with_doc_info(citation, chunks_metadata)
+                    enriched_citations.append(enriched_citation)
+                enriched_result["citations"] = enriched_citations
+            
+            result_json = json.dumps(enriched_result, indent=2)
+            st.download_button(
+                label="Download Result (JSON)",
+                data=result_json,
+                file_name="requirement_result.json",
+                mime="application/json",
+                key="main_single_result_download"
             )
-        
-        st.markdown("---")
-        st.subheader("Results")
-        display_result(result, requirement_text, chunks_metadata)
-        
-        # Download result with enriched citations
-        enriched_result = result.copy()
-        if chunks_metadata and result.get("citations"):
-            enriched_citations = []
-            for citation in result.get("citations", []):
-                enriched_citation = enrich_citation_with_doc_info(citation, chunks_metadata)
-                enriched_citations.append(enriched_citation)
-            enriched_result["citations"] = enriched_citations
-        
-        result_json = json.dumps(enriched_result, indent=2)
-        st.download_button(
-            label="Download Result (JSON)",
-            data=result_json,
-            file_name="requirement_result.json",
-            mime="application/json"
-        )
 
 
 def show_csv_batch_tab(project_id: str, top_k: int):

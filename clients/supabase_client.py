@@ -110,3 +110,36 @@ class SupabaseClient:
             match_count=top_k
         )
 
+    def get_all_prompts(self) -> List[Dict[str, Any]]:
+        """Get all saved prompt templates from Supabase."""
+        try:
+            response = self.client.table('prompt_templates').select('*').order('created_at').execute()
+            return response.data or []
+        except Exception as e:
+            print(f"Error fetching prompts: {str(e)}")
+            return []
+
+    def save_prompt(self, name: str, prompt_text: str, project_id: Optional[str] = None) -> bool:
+        """Save or update a prompt template in Supabase."""
+        try:
+            # Check if prompt with this name already exists
+            existing = self.client.table('prompt_templates').select('id').eq('name', name).execute()
+            
+            data = {
+                'name': name,
+                'prompt_text': prompt_text,
+                'project_id': project_id,
+                'updated_at': 'now()'
+            }
+            
+            if existing.data:
+                # Update
+                self.client.table('prompt_templates').update(data).eq('id', existing.data[0]['id']).execute()
+            else:
+                # Insert
+                self.client.table('prompt_templates').insert(data).execute()
+            return True
+        except Exception as e:
+            print(f"Error saving prompt: {str(e)}")
+            return False
+
