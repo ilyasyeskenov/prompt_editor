@@ -42,7 +42,7 @@ Provide your response in a valid JSON format with the following structure:
 
 
 # Initialize session state
-if 'supabase_client' not in st.session_state:
+if 'supabase_client' not in st.session_state or not hasattr(st.session_state.supabase_client, 'save_prompt'):
     st.session_state.supabase_client = SupabaseClient()
 
 if 'ai_client' not in st.session_state:
@@ -260,6 +260,13 @@ def main():
     
     # Set top_k to default value of 5
     top_k = 5
+    
+    # Reset button in sidebar
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🔄 Reset App Session", help="Clear all session state and reload"):
+        for key in st.session_state.keys():
+            del st.session_state[key]
+        st.rerun()
     
     if not project_id:
         st.info("👈 Please enter a Project ID in the sidebar to continue.")
