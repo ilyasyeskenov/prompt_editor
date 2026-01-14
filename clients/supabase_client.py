@@ -110,16 +110,32 @@ class SupabaseClient:
             match_count=top_k
         )
 
-    def get_all_prompts(self) -> List[Dict[str, Any]]:
-        """Get all saved prompt templates from Supabase."""
+    def get_all_prompts(self, prompt_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get all saved prompt templates from Supabase, optionally filtered by type."""
         try:
-            response = self.client.table('prompt_templates').select('*').order('created_at').execute()
+            query = self.client.table('prompt_templates').select('*')
+            if prompt_type:
+                try:
+                    query = query.eq('prompt_type', prompt_type)
+                    response = query.order('created_at').execute()
+                    return response.data or []
+                except Exception as e:
+                    # Column doesn't exist yet, fall back to loading all prompts
+                    error_str = str(e)
+                    if 'prompt_type' in error_str and 'does not exist' in error_str:
+                        print(f"Note: prompt_type column doesn't exist yet, loading all prompts instead")
+                        # Fall through to load all prompts without filtering
+                    else:
+                        raise
+            
+            # Load all prompts (either no filter requested, or column doesn't exist)
+            response = query.order('created_at').execute()
             return response.data or []
         except Exception as e:
             print(f"Error fetching prompts: {str(e)}")
             return []
 
-    def save_prompt(self, name: str, prompt_text: str, project_id: Optional[str] = None) -> bool:
+    def save_prompt(self, name: str, prompt_text: str, project_id: Optional[str] = None, prompt_type: Optional[str] = None) -> bool:
         """Save or update a prompt template in Supabase."""
         try:
             # Check if prompt with this name already exists
@@ -132,12 +148,37 @@ class SupabaseClient:
                 'updated_at': 'now()'
             }
             
+            # Try to add prompt_type if provided, but don't fail if column doesn't exist
+            if prompt_type:
+                try:
+                    data['prompt_type'] = prompt_type
+                except Exception:
+                    pass  # Column might not exist, continue without it
+            
             if existing.data:
-                # Update
-                self.client.table('prompt_templates').update(data).eq('id', existing.data[0]['id']).execute()
+                # Update - try with prompt_type, fall back without it if column doesn't exist
+                try:
+                    self.client.table('prompt_templates').update(data).eq('id', existing.data[0]['id']).execute()
+                except Exception as e:
+                    error_str = str(e)
+                    if 'prompt_type' in error_str and 'does not exist' in error_str:
+                        # Column doesn't exist, save without prompt_type
+                        data_without_type = {k: v for k, v in data.items() if k != 'prompt_type'}
+                        self.client.table('prompt_templates').update(data_without_type).eq('id', existing.data[0]['id']).execute()
+                    else:
+                        raise
             else:
-                # Insert
-                self.client.table('prompt_templates').insert(data).execute()
+                # Insert - try with prompt_type, fall back without it if column doesn't exist
+                try:
+                    self.client.table('prompt_templates').insert(data).execute()
+                except Exception as e:
+                    error_str = str(e)
+                    if 'prompt_type' in error_str and 'does not exist' in error_str:
+                        # Column doesn't exist, save without prompt_type
+                        data_without_type = {k: v for k, v in data.items() if k != 'prompt_type'}
+                        self.client.table('prompt_templates').insert(data_without_type).execute()
+                    else:
+                        raise
             return True
         except Exception as e:
             print(f"Error saving prompt: {str(e)}")
