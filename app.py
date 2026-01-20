@@ -571,7 +571,8 @@ def main():
     # Project ID selection (global setting)
     PROJECT_OPTIONS = {
         "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
-        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721"
+        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
+        "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63"
     }
     
     selected_project = st.sidebar.selectbox(
