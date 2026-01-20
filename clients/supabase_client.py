@@ -110,6 +110,75 @@ class SupabaseClient:
             match_count=top_k
         )
 
+    def get_chunks_by_hybrid_search(
+        self,
+        project_id: str,
+        query: str,
+        match_count: int = 10,
+        full_text_weight: float = 2.0,
+        semantic_weight: float = 1.0,
+        rrf_k: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Get chunks using database-level hybrid search with RRF.
+        
+        Args:
+            project_id: Project ID to filter chunks (can be UUID or text)
+            query: Search query string
+            match_count: Number of results to return
+            full_text_weight: Weight for full-text search (default: 1.0)
+            semantic_weight: Weight for semantic search (default: 1.0)
+            rrf_k: RRF smoothing constant (default: 50)
+        
+        Returns:
+            List of chunk dictionaries sorted by RRF score
+        """
+        try:
+            # Generate embedding for query
+            query_embedding = self.ai_client.generate_embedding(query)
+            
+            # Pass project_id as-is (database function should handle TEXT/UUID)
+            # If the function still expects UUID, it will error and we'll catch it
+            project_id_param = project_id if project_id else None
+            
+            # Call hybrid_search RPC function (in public schema)
+            response = self.client.rpc(
+                'hybrid_search',
+                {
+                    'query_text': query,
+                    'query_embedding': query_embedding,
+                    'project_id_param': project_id_param,
+                    'match_count': match_count,
+                    'full_text_weight': full_text_weight,
+                    'semantic_weight': semantic_weight,
+                    'rrf_k': rrf_k
+                }
+            ).execute()
+            
+            if response.data:
+                # Transform to match expected format
+                chunks = []
+                for chunk in response.data:
+                    chunks.append({
+                        'id': chunk.get('id', ''),
+                        'content': chunk.get('content', ''),
+                        'task_id': chunk.get('task_id', ''),
+                        'file_name': chunk.get('file_name') or chunk.get('original_filename'),
+                        'original_filename': chunk.get('original_filename'),
+                        'page_number': chunk.get('page_number'),
+                        'metadata': chunk.get('metadata'),
+                        'rrf_score': chunk.get('rrf_score'),
+                        'vector_rank': chunk.get('vector_rank'),
+                        'text_rank': chunk.get('text_rank'),
+                        'similarity': chunk.get('similarity'),
+                        'project_id': chunk.get('project_id'),
+                        'organization_id': chunk.get('organization_id'),
+                    })
+                return chunks
+            return []
+        except Exception as e:
+            raise Exception(f"Error in hybrid search: {str(e)}")
+
     def get_all_prompts(self, prompt_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all saved prompt templates from Supabase, optionally filtered by type."""
         try:

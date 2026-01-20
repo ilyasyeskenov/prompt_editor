@@ -182,14 +182,40 @@ if "Default Breakdown" not in st.session_state.saved_breakdown_prompts:
     st.session_state.saved_breakdown_prompts["Default Breakdown"] = DEFAULT_BREAKDOWN_PROMPT
 
 
-def get_merged_chunks(query: str, project_id: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
-    """Get merged chunks using RAG search. Returns (merged_text, chunks_metadata)."""
+def get_merged_chunks(
+    query: str, 
+    project_id: str, 
+    top_k: int = 5,
+    search_method: str = "semantic"
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Get merged chunks using RAG search. Returns (merged_text, chunks_metadata).
+    
+    Args:
+        query: Search query string
+        project_id: Project ID to filter chunks
+        top_k: Number of chunks to retrieve
+        search_method: "semantic" or "hybrid" (default: "semantic")
+    
+    Returns:
+        Tuple of (merged_text, chunks_metadata)
+    """
     try:
-        relevant_chunks = st.session_state.supabase_client.search_chunks_by_project_id(
-            project_id=project_id,
-            query=query,
-            top_k=top_k
-        )
+        if search_method == "hybrid":
+            # Use hybrid search with RRF
+            relevant_chunks = st.session_state.supabase_client.get_chunks_by_hybrid_search(
+                project_id=project_id,
+                query=query,
+                match_count=top_k
+            )
+        else:
+            # Use semantic (vector-only) search
+            relevant_chunks = st.session_state.supabase_client.search_chunks_by_project_id(
+                project_id=project_id,
+                query=query,
+                top_k=top_k
+            )
+        
         # Merge with file names and page numbers: "chunk-1 (file: doc.pdf, page: 5): <content>..."
         merged_parts = []
         for i, chunk in enumerate(relevant_chunks):
@@ -237,11 +263,26 @@ def process_requirement(
     requirement: str,
     project_id: str,
     prompt_template: str,
-    top_k: int = 5
+    top_k: int = 5,
+    search_method: str = "semantic"
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Process a single requirement using RAG and AI. Returns (result, chunks_metadata)."""
+    """
+    Process a single requirement using RAG and AI. Returns (result, chunks_metadata).
+    
+    Args:
+        requirement: Requirement text to verify
+        project_id: Project ID to filter chunks
+        prompt_template: Prompt template to use
+        top_k: Number of chunks to retrieve
+        search_method: "semantic" or "hybrid" (default: "semantic")
+    """
     # Get chunks using RAG
-    document_chunks_text, chunks_metadata = get_merged_chunks(requirement, project_id, top_k)
+    document_chunks_text, chunks_metadata = get_merged_chunks(
+        requirement, 
+        project_id, 
+        top_k,
+        search_method=search_method
+    )
     return process_requirement_with_chunks(requirement, document_chunks_text, chunks_metadata, prompt_template)
 
 
@@ -351,6 +392,61 @@ def enrich_citation_with_doc_info(citation: Dict[str, Any], chunks_metadata: Lis
     return citation_copy
 
 
+def display_chunks_metadata(chunks_metadata: List[Dict[str, Any]], search_method: str = "semantic"):
+    """Display chunk metadata in a nice table format."""
+    if not chunks_metadata:
+        st.info("No chunks retrieved.")
+        return
+    
+    st.subheader("📚 Retrieved Chunks")
+    
+    # Create a DataFrame for display
+    display_data = []
+    for i, chunk in enumerate(chunks_metadata, 1):
+        file_name = chunk.get('file_name') or chunk.get('original_filename') or 'Unknown'
+        page_num = chunk.get('page_number')
+        page_display = page_num if page_num is not None else 'N/A'
+        
+        row_data = {
+            'Rank': i,
+            'Document': file_name,
+            'Page': page_display,
+        }
+        
+        # Add search-specific metrics
+        if search_method == "hybrid":
+            rrf_score = chunk.get('rrf_score')
+            vector_rank = chunk.get('vector_rank')
+            text_rank = chunk.get('text_rank')
+            
+            row_data['RRF Score'] = f"{rrf_score:.4f}" if rrf_score is not None else 'N/A'
+            row_data['Vector Rank'] = vector_rank if vector_rank is not None else 'N/A'
+            row_data['Text Rank'] = text_rank if text_rank is not None else 'N/A'
+        else:
+            similarity = chunk.get('similarity')
+            row_data['Similarity'] = f"{similarity:.4f}" if similarity is not None else 'N/A'
+        
+        display_data.append(row_data)
+    
+    df = pd.DataFrame(display_data)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # Summary stats
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Chunks", len(chunks_metadata))
+    with col2:
+        unique_files = len(set(chunk.get('file_name') or chunk.get('original_filename') or 'Unknown' for chunk in chunks_metadata))
+        st.metric("Unique Documents", unique_files)
+    with col3:
+        if search_method == "hybrid":
+            avg_rrf = sum(chunk.get('rrf_score', 0) or 0 for chunk in chunks_metadata) / len(chunks_metadata) if chunks_metadata else 0
+            st.metric("Avg RRF Score", f"{avg_rrf:.4f}")
+        else:
+            avg_sim = sum(chunk.get('similarity', 0) or 0 for chunk in chunks_metadata) / len(chunks_metadata) if chunks_metadata else 0
+            st.metric("Avg Similarity", f"{avg_sim:.4f}")
+
+
 def display_result(result: Dict[str, Any], chunks_metadata: List[Dict[str, Any]] = None, key_suffix: str = ""):
     """Display a single requirement result."""
     # Status badge
@@ -404,6 +500,30 @@ def display_result(result: Dict[str, Any], chunks_metadata: List[Dict[str, Any]]
                 if citation.get("document_reference") and citation.get("document_reference") != doc_name:
                     st.write("**Original Reference:**")
                     st.caption(citation.get("document_reference", "N/A"))
+                
+                # Find matching chunk and show full content option
+                if chunks_metadata:
+                    source_text = citation.get("source_text", "").strip().lower()
+                    matching_chunk = None
+                    for chunk in chunks_metadata:
+                        chunk_content = chunk.get('content', '').lower()
+                        # Try to find chunk containing the source text
+                        if source_text and (source_text in chunk_content or 
+                                          (len(source_text) > 20 and source_text[:20] in chunk_content)):
+                            matching_chunk = chunk
+                            break
+                    
+                    if matching_chunk:
+                        full_content = matching_chunk.get('content', '')
+                        if full_content:
+                            with st.expander("📄 View Full Chunk Content", expanded=False):
+                                st.text_area(
+                                    "Full chunk content:",
+                                    value=full_content,
+                                    height=300,
+                                    disabled=True,
+                                    key=f"full_chunk_{i}_{key_suffix}"
+                                )
     
     # JSON Output
     st.markdown("---")
@@ -441,14 +561,22 @@ def main():
     st.title("📋 Requirement Checker")
     st.markdown("---")
     
-    # Project ID input (global setting) - default from testing notebook
-    DEFAULT_PROJECT_ID = "93d3a25b-d15d-4689-affb-d027bbc422e7"
-    project_id = st.sidebar.text_input(
-        "Project ID",
-        value=DEFAULT_PROJECT_ID,
-        help="Enter the project_id to check requirements against documents in Supabase",
-        key="project_id_input"
+    # Project ID selection (global setting)
+    PROJECT_OPTIONS = {
+        "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
+        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721"
+    }
+    
+    selected_project = st.sidebar.selectbox(
+        "Project",
+        options=list(PROJECT_OPTIONS.keys()),
+        index=0,  # Default to "Building services"
+        help="Select the project to check requirements against documents in Supabase",
+        key="project_selection"
     )
+    
+    # Get the actual project ID from the selection
+    project_id = PROJECT_OPTIONS[selected_project]
     
     # Set top_k to default value of 5
     top_k = 5
@@ -804,6 +932,23 @@ def show_single_requirement_tab(project_id: str, top_k: int):
     # Requirement input
     st.subheader("Requirement Input & Testing")
     
+    # Search method selection
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        search_method = st.radio(
+            "🔍 Search Method",
+            options=["semantic", "hybrid"],
+            index=0,
+            help="Semantic: Vector similarity only. Hybrid: Combines keyword + semantic search with RRF ranking.",
+            horizontal=True
+        )
+    
+    with col2:
+        if search_method == "hybrid":
+            st.caption("💡 Hybrid search combines keyword matching with semantic understanding for better accuracy")
+        else:
+            st.caption("💡 Semantic search finds documents by meaning/similarity")
+    
     # Comparison Mode
     prompts_to_compare = st.multiselect(
         "⚖️ Select Saved Prompts to Compare",
@@ -830,10 +975,20 @@ def show_single_requirement_tab(project_id: str, top_k: int):
             active_prompts = { name: st.session_state.saved_prompts[name] for name in prompts_to_compare }
             
             with st.spinner(f"Comparing {len(active_prompts)} prompts..."):
-                document_chunks_text, chunks_metadata = get_merged_chunks(requirement_text, project_id, top_k)
+                document_chunks_text, chunks_metadata = get_merged_chunks(
+                    requirement_text, 
+                    project_id, 
+                    top_k,
+                    search_method=search_method
+                )
                 if not document_chunks_text:
                     st.error("No relevant documents found.")
                     return
+                
+                # Display chunk metadata first
+                st.markdown("---")
+                display_chunks_metadata(chunks_metadata, search_method=search_method)
+                st.markdown("---")
                 
                 # Side-by-side columns
                 cols = st.columns(len(active_prompts))
@@ -854,9 +1009,13 @@ def show_single_requirement_tab(project_id: str, top_k: int):
                     requirement=requirement_text,
                     project_id=project_id,
                     prompt_template=prompt_template,
-                    top_k=top_k
+                    top_k=top_k,
+                    search_method=search_method
                 )
             
+            st.markdown("---")
+            # Display chunk metadata before results
+            display_chunks_metadata(chunks_metadata, search_method=search_method)
             st.markdown("---")
             st.subheader("Results")
             display_result(result, chunks_metadata, key_suffix="single")
@@ -1002,6 +1161,25 @@ def show_csv_batch_tab(project_id: str, top_k: int):
         </div>
         """, unsafe_allow_html=True)
     
+    # Search method selection for batch processing
+    st.markdown("---")
+    st.subheader("🔍 Search Configuration")
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        batch_search_method = st.radio(
+            "Search Method",
+            options=["semantic", "hybrid"],
+            index=0,
+            help="Semantic: Vector similarity only. Hybrid: Combines keyword + semantic search with RRF ranking.",
+            horizontal=True,
+            key="batch_search_method"
+        )
+    with col2:
+        if batch_search_method == "hybrid":
+            st.caption("💡 Hybrid search combines keyword matching with semantic understanding for better accuracy")
+        else:
+            st.caption("💡 Semantic search finds documents by meaning/similarity")
+    
     # Process button
     if st.button("Process CSV", type="primary", key="process_csv"):
         if requirement_column not in df.columns:
@@ -1047,7 +1225,8 @@ def show_csv_batch_tab(project_id: str, top_k: int):
                         requirement=requirement,
                         project_id=project_id,
                         prompt_template=batch_prompt_template,
-                        top_k=top_k
+                        top_k=top_k,
+                        search_method=batch_search_method
                     )
                     results_data.append(result)
                     chunks_metadata_list.append(chunks_metadata)
