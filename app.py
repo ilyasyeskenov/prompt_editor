@@ -93,7 +93,14 @@ User Query: {{query}}"""
 
 # Initialize session state
 # #region agent log
-if 'supabase_client' not in st.session_state or not hasattr(st.session_state.supabase_client, 'save_prompt'):
+# Check if supabase_client exists and has all required methods
+needs_init = (
+    'supabase_client' not in st.session_state or 
+    not hasattr(st.session_state.supabase_client, 'save_prompt') or
+    not hasattr(st.session_state.supabase_client, 'get_chunks_by_hybrid_search')
+)
+
+if needs_init:
     _log("A", "app.py:74", "Initializing SupabaseClient", {})
     try:
         st.session_state.supabase_client = SupabaseClient()
