@@ -1,616 +1,33 @@
+"""Main Streamlit application for Requirement Checker."""
 import streamlit as st
 import pandas as pd
 import json
-from typing import List, Dict, Any, Optional, Tuple
-from clients.supabase_client import SupabaseClient
-from clients.ai_client import AIClient
-from config.config import TOP_K_CHUNKS, OPENAI_MODEL
 import traceback
-from datetime import datetime
+from typing import List, Dict, Any
 
-# #region agent log
-LOG_PATH = "/Users/ilyasyeskenov/Desktop/req_check/.cursor/debug.log"
-def _log(hypothesis_id: str, location: str, message: str, data: dict = None):
-    try:
-        log_entry = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": hypothesis_id,
-            "timestamp": int(datetime.now().timestamp() * 1000),
-            "location": location,
-            "message": message,
-            "data": data or {}
-        }
-        with open(LOG_PATH, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except:
-        pass
-# #endregion
-
-# Default prompt template
-DEFAULT_PROMPT = """You are an expert Construction Compliance Auditor and Quality Assurance Specialist. Your role is to rigorously analyze technical documentation to verify if specific project requirements have been met.
-
-**Your Goal:**
-Analyze the provided supporting documents to determine if the specific Requirement (provided below) is fulfilled. You must provide a justification based *strictly* on the evidence found in the text.
-
-**Input Context:**
-- **Requirement to Verify:** "{{requirement_text}}"
-- **Supporting Documents:**
-{{documentChunkTexts}}
-
-**Step-by-Step Reasoning Process:**
-1.  **Analyze the Requirement:** Break down the specific requirement into its constituent conditions (e.g., specific materials, dimensions, safety standards, certifications, or tolerances).
-2.  **Scan for Evidence:** Search the Supporting Documents for exact keywords, synonyms, or technical specifications that match the requirement's conditions.
-3.  **Evaluate Completeness:** Determine if the evidence covers the *entirety* of the requirement or only parts of it.
-4.  **Formulate Justification:** Construct an argument linking the text in the documents to the requirement conditions.
-
-**Output Instructions:**
-Provide your response in a valid JSON format with the following structure:
-
-```json
-{
-  "status": "FULFILLED" | "PARTIALLY_FULFILLED" | "NOT_FULFILLED",
-  "relevance_score": <integer_0_to_10>,
-  "justification": "<A detailed explanation of how the document satisfies the requirement. If partially fulfilled, explicitly explain what is missing.>",
-  "citations": [
-    {
-      "source_text": "<The exact verbatim quote from the document used as evidence>",
-      "document_reference": "<The name, page number, or ID of the specific document chunk if available>"
-    }
-    ]
-}
-```"""
-
-# Default breakdown prompt template
-DEFAULT_BREAKDOWN_PROMPT = """Break down the provided requirement into individual sub-requirements if it is complex.
-A requirement is considered complex if it involves multiple actions, systems, equipment, or processes.
-If the requirement is simple (e.g., involves a single action or system), return the original requirement as is.
-
-Instructions:
-Generate up to 5 sub-requirements, ensuring each is distinct and relevant to the original requirement.
-Each sub-requirement must be self-contained and include all key systems, equipment, locations, and processes mentioned in the original requirement, even if this causes repetition.
-Exclude references to actors (e.g., “the Contractor,” “the operator,” “staff”). Only include systems, equipment, locations, and processes.
-Do not reword the original requirement excessively; preserve its terminology and original technical meaning.
-If the requirement does not specify systems, equipment, locations, or processes, note this clearly and proceed with the breakdown based on available information.
-
-Example Requirement:
-(S320.2B.16.1) (c) All SAMS alarms can be monitored through the MCS workstation. The geographic location of an activated alarm is clearly shown on a station layout display.
-
-Sub-requirements Generated:
-All SAMS alarms can be monitored through the MCS workstation.
-The geographic location of an activated SAMS alarm is clearly shown on a station layout display.
-
-Example Complex Requirement:
-(S450.1A.22.3) The HVAC system must maintain temperature control within ±2°C and log performance data to the BMS, while the control panel displays real-time status updates.
-
-Sub-requirements Generated:
-The HVAC system maintains temperature control within ±2°C.
-The HVAC system logs performance data to the BMS.
-The HVAC system control panel displays real-time status updates of the HVAC system within the BMS environment.
-
-User Query: {{query}}"""
-
-
-# Initialize session state
-# #region agent log
-# Check if supabase_client exists and has all required methods
-needs_init = (
-    'supabase_client' not in st.session_state or 
-    not hasattr(st.session_state.supabase_client, 'save_prompt') or
-    not hasattr(st.session_state.supabase_client, 'get_chunks_by_hybrid_search')
+# Import utilities
+from utils.session_state import initialize_session_state
+from utils.prompts import DEFAULT_PROMPT, DEFAULT_BREAKDOWN_PROMPT
+from utils.rag_operations import get_merged_chunks
+from utils.ai_processing import (
+    process_breakdown,
+    process_requirement, 
+    process_requirement_with_chunks
+)
+from utils.ui_components import display_chunks_metadata, display_result, enrich_citation_with_doc_info
+from utils.pdf_processor import extract_text_from_pdf
+from utils.logging import log
+from config.config import OPENAI_MODEL
+from tender_checker.workflow import TenderCheckWorkflow
+from tender_checker.prompts.agent_prompts import (
+    BREAKDOWN_AGENT_PROMPT,
+    OMISSION_CHECKER_PROMPT,
+    CONTRADICTION_CHECKER_PROMPT,
+    ORCHESTRATOR_PROMPT
 )
 
-if needs_init:
-    _log("A", "app.py:74", "Initializing SupabaseClient", {})
-    try:
-        st.session_state.supabase_client = SupabaseClient()
-        _log("A", "app.py:76", "SupabaseClient initialized successfully", {})
-    except Exception as e:
-        _log("A", "app.py:76", "SupabaseClient initialization failed", {"error": str(e), "traceback": traceback.format_exc()})
-        raise
-# #endregion
-
-# #region agent log
-if 'ai_client' not in st.session_state:
-    _log("A", "app.py:79", "Initializing AIClient", {})
-    try:
-        st.session_state.ai_client = AIClient()
-        _log("A", "app.py:81", "AIClient initialized successfully", {})
-    except Exception as e:
-        _log("A", "app.py:81", "AIClient initialization failed", {"error": str(e), "traceback": traceback.format_exc()})
-        raise
-# #endregion
-
-if 'current_prompt' not in st.session_state:
-    st.session_state.current_prompt = DEFAULT_PROMPT
-
-if 'current_breakdown_prompt' not in st.session_state:
-    st.session_state.current_breakdown_prompt = DEFAULT_BREAKDOWN_PROMPT
-
-if 'saved_prompts' not in st.session_state:
-    # Initialize with default
-    st.session_state.saved_prompts = {"Default": DEFAULT_PROMPT}
-    # Try to load requirement prompts from Supabase on first run
-    try:
-        # Load prompts with type "requirement" or no type (for backward compatibility)
-        db_requirement_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="requirement")
-        db_all_prompts = st.session_state.supabase_client.get_all_prompts()  # Get all for backward compatibility
-        
-        # Add requirement prompts
-        for p in db_requirement_prompts:
-            st.session_state.saved_prompts[p['name']] = p['prompt_text']
-        
-        # For backward compatibility: add prompts without type that look like requirement prompts
-        for p in db_all_prompts:
-            prompt_type = p.get('prompt_type')
-            if prompt_type is None:  # No type assigned (old prompts)
-                # Use heuristic: if it has {{requirement_text}}, it's a requirement prompt
-                if "{{requirement_text}}" in p.get('prompt_text', ''):
-                    if p['name'] not in st.session_state.saved_prompts:
-                        st.session_state.saved_prompts[p['name']] = p['prompt_text']
-    except Exception as e:
-        st.sidebar.error(f"Error loading prompts: {e}")
-
-if 'saved_breakdown_prompts' not in st.session_state:
-    st.session_state.saved_breakdown_prompts = {"Default Breakdown": DEFAULT_BREAKDOWN_PROMPT}
-    # Load breakdown prompts from Supabase
-    try:
-        db_breakdown_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="breakdown")
-        db_all_prompts = st.session_state.supabase_client.get_all_prompts()  # Get all for backward compatibility
-        
-        # Add breakdown prompts
-        for p in db_breakdown_prompts:
-            st.session_state.saved_breakdown_prompts[p['name']] = p['prompt_text']
-        
-        # For backward compatibility: add prompts without type that look like breakdown prompts
-        for p in db_all_prompts:
-            prompt_type = p.get('prompt_type')
-            if prompt_type is None:  # No type assigned (old prompts)
-                # Use heuristic: if it has {{query}} but not {{requirement_text}}, it's a breakdown prompt
-                prompt_text = p.get('prompt_text', '')
-                if "{{query}}" in prompt_text and "{{requirement_text}}" not in prompt_text:
-                    if p['name'] not in st.session_state.saved_breakdown_prompts:
-                        st.session_state.saved_breakdown_prompts[p['name']] = prompt_text
-    except Exception as e:
-        st.sidebar.error(f"Error loading breakdown prompts: {e}")
-else:
-    # Refresh breakdown prompts from Supabase to ensure they're in sync
-    try:
-        db_breakdown_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="breakdown")
-        for p in db_breakdown_prompts:
-            st.session_state.saved_breakdown_prompts[p['name']] = p['prompt_text']
-    except Exception as e:
-        pass  # Silently fail on refresh to avoid disrupting user experience
-
-# Ensure 'Default' is always there
-if "Default" not in st.session_state.saved_prompts:
-    st.session_state.saved_prompts["Default"] = DEFAULT_PROMPT
-if "Default Breakdown" not in st.session_state.saved_breakdown_prompts:
-    st.session_state.saved_breakdown_prompts["Default Breakdown"] = DEFAULT_BREAKDOWN_PROMPT
-
-
-def get_merged_chunks(
-    query: str, 
-    project_id: str, 
-    top_k: int = 5,
-    search_method: str = "semantic"
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Get merged chunks using RAG search. Returns (merged_text, chunks_metadata).
-    
-    Args:
-        query: Search query string
-        project_id: Project ID to filter chunks
-        top_k: Number of chunks to retrieve
-        search_method: "semantic" or "hybrid" (default: "semantic")
-    
-    Returns:
-        Tuple of (merged_text, chunks_metadata)
-    """
-    try:
-        if search_method == "hybrid":
-            # Use hybrid search with RRF
-            relevant_chunks = st.session_state.supabase_client.get_chunks_by_hybrid_search(
-                project_id=project_id,
-                query=query,
-                match_count=top_k
-            )
-        else:
-            # Use semantic (vector-only) search
-            relevant_chunks = st.session_state.supabase_client.search_chunks_by_project_id(
-                project_id=project_id,
-                query=query,
-                top_k=top_k
-            )
-        
-        # Merge with file names and page numbers: "chunk-1 (file: doc.pdf, page: 5): <content>..."
-        merged_parts = []
-        for i, chunk in enumerate(relevant_chunks):
-            file_name = chunk.get('file_name') or chunk.get('original_filename') or 'Unknown'
-            page_num = chunk.get('page_number')
-            page_info = f", page: {page_num}" if page_num else ""
-            chunk_header = f"chunk-{i+1} (file: {file_name}{page_info})"
-            merged_parts.append(f"{chunk_header}: {chunk.get('content', '')}")
-        
-        merged = "\n".join(merged_parts)
-        return merged, relevant_chunks
-    except Exception as e:
-        st.error(f"Error fetching chunks for query '{query}': {str(e)}")
-        return "", []
-
-
-def process_breakdown(requirement: str, prompt_template: str) -> str:
-    """Process a requirement breakdown using AI."""
-    # Format the prompt
-    prompt = prompt_template.replace("{{query}}", requirement)
-    
-    # Call AI
-    try:
-        response = st.session_state.ai_client.client.chat.completions.create(
-            model=st.session_state.ai_client.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert in breaking down technical requirements."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.1
-        )
-        
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error processing breakdown: {str(e)}"
-
-
-def process_requirement(
-    requirement: str,
-    project_id: str,
-    prompt_template: str,
-    top_k: int = 5,
-    search_method: str = "semantic"
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Process a single requirement using RAG and AI. Returns (result, chunks_metadata).
-    
-    Args:
-        requirement: Requirement text to verify
-        project_id: Project ID to filter chunks
-        prompt_template: Prompt template to use
-        top_k: Number of chunks to retrieve
-        search_method: "semantic" or "hybrid" (default: "semantic")
-    """
-    # Get chunks using RAG
-    document_chunks_text, chunks_metadata = get_merged_chunks(
-        requirement, 
-        project_id, 
-        top_k,
-        search_method=search_method
-    )
-    return process_requirement_with_chunks(requirement, document_chunks_text, chunks_metadata, prompt_template)
-
-
-def process_requirement_with_chunks(
-    requirement: str,
-    document_chunks_text: str,
-    chunks_metadata: List[Dict[str, Any]],
-    prompt_template: str
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Helper to process requirement with pre-fetched chunks."""
-    if not document_chunks_text:
-        return {
-            "status": "NOT_FULFILLED",
-            "relevance_score": 0,
-            "justification": "No relevant documents found to verify this requirement.",
-            "citations": []
-        }, []
-    
-    # Format the prompt
-    prompt = prompt_template.replace("{{requirement_text}}", requirement)
-    prompt = prompt.replace("{{documentChunkTexts}}", document_chunks_text)
-    
-    # Call AI
-    try:
-        response = st.session_state.ai_client.client.chat.completions.create(
-            model=st.session_state.ai_client.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert Construction Compliance Auditor. Always return valid JSON."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1
-        )
-        
-        # #region agent log
-        response_content = response.choices[0].message.content
-        _log("C", "app.py:218", "AI response received", {"content_length": len(response_content), "content_preview": response_content[:200]})
-        # #endregion
-        
-        # #region agent log
-        try:
-            result = json.loads(response_content)
-            _log("C", "app.py:220", "JSON parsing successful", {"result_keys": list(result.keys()) if isinstance(result, dict) else None})
-        except json.JSONDecodeError as e:
-            _log("C", "app.py:220", "JSON parsing failed", {"error": str(e), "content_preview": response_content[:500]})
-            raise
-        # #endregion
-        
-        return result, chunks_metadata
-    except Exception as e:
-        # #region agent log
-        _log("C", "app.py:227", "Exception in process_requirement_with_chunks", {"error": str(e), "traceback": traceback.format_exc()})
-        # #endregion
-        st.error(f"Error processing requirement: {str(e)}")
-        return {
-            "status": "ERROR",
-            "relevance_score": 0,
-            "justification": f"Error: {str(e)}",
-            "citations": []
-        }, chunks_metadata
-
-
-def enrich_citation_with_doc_info(citation: Dict[str, Any], chunks_metadata: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Enrich citation with document name by matching source text to chunks."""
-    # #region agent log
-    _log("F", "app.py:232", "enrich_citation_with_doc_info called", {"chunks_metadata_type": type(chunks_metadata).__name__, "chunks_metadata_is_none": chunks_metadata is None, "chunks_metadata_len": len(chunks_metadata) if chunks_metadata else 0})
-    # #endregion
-    
-    # #region agent log
-    if chunks_metadata is None:
-        _log("F", "app.py:235", "chunks_metadata is None, using empty list", {})
-        chunks_metadata = []
-    # #endregion
-    
-    source_text = citation.get("source_text", "").strip()
-    if not source_text:
-        return citation
-        
-    source_text_lower = source_text.lower()
-    doc_ref = citation.get("document_reference", "")
-    
-    best_match = None
-    
-    # Try to find the chunk that contains the source text
-    for chunk in chunks_metadata:
-        chunk_content = chunk.get('content', '').lower()
-        # If verbatim in chunk, it's a strong match
-        if source_text_lower in chunk_content or (len(source_text_lower) > 20 and source_text_lower[:20] in chunk_content):
-            best_match = chunk
-            break
-    
-    if best_match:
-        file_name = best_match.get('file_name') or best_match.get('original_filename')
-        page_number = best_match.get('page_number')
-        if file_name:
-            # Enhance document reference with actual file name
-            doc_ref = f"{file_name}" + (f" (page {page_number})" if page_number else "")
-    
-    citation_copy = citation.copy()
-    citation_copy["document_name"] = doc_ref
-    return citation_copy
-
-
-def display_chunks_metadata(chunks_metadata: List[Dict[str, Any]], search_method: str = "semantic"):
-    """Display chunk metadata in a nice table format."""
-    if not chunks_metadata:
-        st.info("No chunks retrieved.")
-        return
-    
-    st.subheader("📚 Retrieved Chunks")
-    
-    # Create a DataFrame for display
-    display_data = []
-    for i, chunk in enumerate(chunks_metadata, 1):
-        file_name = chunk.get('file_name') or chunk.get('original_filename') or 'Unknown'
-        page_num = chunk.get('page_number')
-        page_display = page_num if page_num is not None else 'N/A'
-        
-        row_data = {
-            'Rank': i,
-            'Document': file_name,
-            'Page': page_display,
-        }
-        
-        # Add search-specific metrics
-        if search_method == "hybrid":
-            rrf_score = chunk.get('rrf_score')
-            vector_rank = chunk.get('vector_rank')
-            text_rank = chunk.get('text_rank')
-            
-            row_data['RRF Score'] = f"{rrf_score:.4f}" if rrf_score is not None else 'N/A'
-            row_data['Vector Rank'] = vector_rank if vector_rank is not None else 'N/A'
-            row_data['Text Rank'] = text_rank if text_rank is not None else 'N/A'
-        else:
-            similarity = chunk.get('similarity')
-            row_data['Similarity'] = f"{similarity:.4f}" if similarity is not None else 'N/A'
-        
-        display_data.append(row_data)
-    
-    df = pd.DataFrame(display_data)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    
-    # Summary stats
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Chunks", len(chunks_metadata))
-    with col2:
-        unique_files = len(set(chunk.get('file_name') or chunk.get('original_filename') or 'Unknown' for chunk in chunks_metadata))
-        st.metric("Unique Documents", unique_files)
-    with col3:
-        if search_method == "hybrid":
-            avg_rrf = sum(chunk.get('rrf_score', 0) or 0 for chunk in chunks_metadata) / len(chunks_metadata) if chunks_metadata else 0
-            st.metric("Avg RRF Score", f"{avg_rrf:.4f}")
-        else:
-            avg_sim = sum(chunk.get('similarity', 0) or 0 for chunk in chunks_metadata) / len(chunks_metadata) if chunks_metadata else 0
-            st.metric("Avg Similarity", f"{avg_sim:.4f}")
-
-
-def display_result(result: Dict[str, Any], chunks_metadata: List[Dict[str, Any]] = None, key_suffix: str = ""):
-    """Display a single requirement result."""
-    # Status badge
-    status = result.get("status", "UNKNOWN")
-    if status == "FULFILLED":
-        st.success(f"✅ Status: {status}")
-    elif status == "PARTIALLY_FULFILLED":
-        st.warning(f"⚠️ Status: {status}")
-    elif status == "NOT_FULFILLED":
-        st.error(f"❌ Status: {status}")
-    else:
-        st.info(f"Status: {status}")
-    
-    # Relevance Score
-    # #region agent log
-    raw_score = result.get("relevance_score", 0)
-    _log("D", "app.py:277", "Processing relevance_score", {"raw_score": raw_score, "type": type(raw_score).__name__})
-    # #endregion
-    
-    # #region agent log
-    try:
-        score = int(raw_score) if raw_score is not None else 0
-        _log("D", "app.py:280", "relevance_score converted successfully", {"score": score})
-    except (ValueError, TypeError) as e:
-        _log("D", "app.py:280", "relevance_score conversion failed", {"error": str(e), "raw_score": raw_score})
-        score = 0
-    # #endregion
-    
-    st.metric("Relevance Score", f"{score}/10")
-    
-    # Justification
-    st.subheader("Justification")
-    st.write(result.get("justification", "No justification provided."))
-    
-    # Citations
-    citations = result.get("citations", [])
-    if citations:
-        st.subheader("Citations")
-        for i, citation in enumerate(citations, 1):
-            # Enrich citation with document info if chunks metadata available
-            if chunks_metadata:
-                citation = enrich_citation_with_doc_info(citation, chunks_metadata)
-            
-            doc_name = citation.get("document_name") or citation.get("document_reference", "N/A")
-            
-            with st.expander(f"Citation {i}: {doc_name}"):
-                st.write("**Document:**")
-                st.info(doc_name)
-                st.write("**Source Text:**")
-                st.code(citation.get("source_text", ""))
-                if citation.get("document_reference") and citation.get("document_reference") != doc_name:
-                    st.write("**Original Reference:**")
-                    st.caption(citation.get("document_reference", "N/A"))
-                
-                # Find matching chunk and show full content option
-                if chunks_metadata:
-                    source_text = citation.get("source_text", "").strip().lower()
-                    matching_chunk = None
-                    for chunk in chunks_metadata:
-                        chunk_content = chunk.get('content', '').lower()
-                        # Try to find chunk containing the source text
-                        if source_text and (source_text in chunk_content or 
-                                          (len(source_text) > 20 and source_text[:20] in chunk_content)):
-                            matching_chunk = chunk
-                            break
-                    
-                    if matching_chunk:
-                        full_content = matching_chunk.get('content', '')
-                        if full_content:
-                            with st.expander("📄 View Full Chunk Content", expanded=False):
-                                st.text_area(
-                                    "Full chunk content:",
-                                    value=full_content,
-                                    height=300,
-                                    disabled=True,
-                                    key=f"full_chunk_{i}_{key_suffix}"
-                                )
-    
-    # JSON Output
-    st.markdown("---")
-    with st.expander("📄 View Raw JSON Output", expanded=False):
-        # Create enriched result with document names in citations
-        enriched_result = result.copy()
-        if chunks_metadata and citations:
-            enriched_citations = []
-            for citation in citations:
-                enriched_citation = enrich_citation_with_doc_info(citation, chunks_metadata)
-                enriched_citations.append(enriched_citation)
-            enriched_result["citations"] = enriched_citations
-        
-        st.json(enriched_result)
-        
-        # Copy button
-        result_json = json.dumps(enriched_result, indent=2)
-        st.download_button(
-            label="📥 Download JSON",
-            data=result_json,
-            file_name="requirement_result.json",
-            mime="application/json",
-            key=f"json_download_from_view_{key_suffix}"
-        )
-
-
-def main():
-    """Main Streamlit app."""
-    st.set_page_config(
-        page_title="Requirement Checker",
-        page_icon="📋",
-        layout="wide"
-    )
-    
-    st.title("📋 Requirement Checker")
-    st.markdown("---")
-    
-    # Project ID selection (global setting)
-    PROJECT_OPTIONS = {
-        "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
-        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
-        "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63"
-    }
-    
-    selected_project = st.sidebar.selectbox(
-        "Project",
-        options=list(PROJECT_OPTIONS.keys()),
-        index=0,  # Default to "Building services"
-        help="Select the project to check requirements against documents in Supabase",
-        key="project_selection"
-    )
-    
-    # Get the actual project ID from the selection
-    project_id = PROJECT_OPTIONS[selected_project]
-    
-    # Set top_k to default value of 5
-    top_k = 5
-    
-    # Reset button in sidebar
-    st.sidebar.markdown("---")
-    if st.sidebar.button("🔄 Reset App Session", help="Clear all session state and reload"):
-        for key in st.session_state.keys():
-            del st.session_state[key]
-        st.rerun()
-    
-    if not project_id:
-        st.info("👈 Please enter a Project ID in the sidebar to continue.")
-        return
-    
-    # Create tabs
-    tab1, tab2, tab3 = st.tabs(["🔍 Single Requirement", "📊 CSV Batch Processing", "✂️ Requirement Breakdown"])
-    
-    with tab1:
-        show_single_requirement_tab(project_id, top_k)
-    
-    with tab2:
-        show_csv_batch_tab(project_id, top_k)
-
-    with tab3:
-        show_breakdown_tab(project_id)
+# Initialize session state
+initialize_session_state()
 
 
 def show_breakdown_tab(project_id: str):
@@ -625,24 +42,16 @@ def show_breakdown_tab(project_id: str):
 
     # Callback for load
     def load_breakdown():
-        # #region agent log
-        _log("B", "app.py:382", "load_breakdown called", {})
-        # #endregion
+        log("B", "app.py", "load_breakdown called", {})
         if "breakdown_prompt_to_load" in st.session_state:
             selected = st.session_state.breakdown_prompt_to_load
-            # #region agent log
-            _log("B", "app.py:386", "Attempting to load breakdown prompt", {"selected": selected, "available_keys": list(st.session_state.saved_breakdown_prompts.keys())})
-            # #endregion
+            log("B", "app.py", "Attempting to load breakdown prompt", {"selected": selected, "available_keys": list(st.session_state.saved_breakdown_prompts.keys())})
             try:
                 st.session_state.current_breakdown_prompt = st.session_state.saved_breakdown_prompts[selected]
                 st.session_state.breakdown_prompt_editor = st.session_state.saved_breakdown_prompts[selected]
-                # #region agent log
-                _log("B", "app.py:389", "Breakdown prompt loaded successfully", {"selected": selected})
-                # #endregion
+                log("B", "app.py", "Breakdown prompt loaded successfully", {"selected": selected})
             except KeyError as e:
-                # #region agent log
-                _log("B", "app.py:389", "KeyError loading breakdown prompt", {"selected": selected, "error": str(e)})
-                # #endregion
+                log("B", "app.py", "KeyError loading breakdown prompt", {"selected": selected, "error": str(e)})
                 raise
 
     # Prompt editor with enhanced UI
@@ -656,7 +65,7 @@ def show_breakdown_tab(project_id: str):
             "Edit the breakdown prompt template below:",
             value=st.session_state.current_breakdown_prompt,
             height=450,
-            help="💡 Tip: Use {{query}} as placeholder",
+            help="💡 Tip: Use {{requirement_text}} or {{query}} as placeholder",
             key="breakdown_prompt_editor",
             label_visibility="visible"
         )
@@ -675,15 +84,11 @@ def show_breakdown_tab(project_id: str):
         
         # Load logic
         breakdown_names = list(st.session_state.saved_breakdown_prompts.keys())
-        # #region agent log
-        _log("E", "app.py:420", "Initializing breakdown selectbox", {"options_count": len(breakdown_names), "options": breakdown_names})
-        # #endregion
+        log("E", "app.py", "Initializing breakdown selectbox", {"options_count": len(breakdown_names), "options": breakdown_names})
         if breakdown_names:
             st.selectbox("📂 Load Saved Breakdown Prompt", options=breakdown_names, index=0, key="breakdown_prompt_to_load")
         else:
-            # #region agent log
-            _log("E", "app.py:423", "Empty breakdown_names list, using placeholder", {})
-            # #endregion
+            log("E", "app.py", "Empty breakdown_names list, using placeholder", {})
             st.selectbox("📂 Load Saved Breakdown Prompt", options=["No prompts available"], index=0, key="breakdown_prompt_to_load", disabled=True)
         if st.button("📂 Load Selected", key="load_breakdown_btn", use_container_width=True, on_click=load_breakdown):
             st.rerun()
@@ -699,9 +104,7 @@ def show_breakdown_tab(project_id: str):
                     prompt_type="breakdown"
                 )
                 if success:
-                    # Add to saved_prompts first (this is what gets saved to Supabase)
                     st.session_state.saved_prompts[new_breakdown_name] = breakdown_prompt_template
-                    # Always add to saved_breakdown_prompts since this is explicitly a breakdown prompt
                     st.session_state.saved_breakdown_prompts[new_breakdown_name] = breakdown_prompt_template
                     st.success(f"Saved to database!")
                     st.rerun()
@@ -714,14 +117,18 @@ def show_breakdown_tab(project_id: str):
         st.markdown("### Placeholders")
         st.markdown("""
         <div style='background-color: #e8f4f8; padding: 10px; border-radius: 5px; margin: 10px 0;'>
-            <code style='color: #d63384;'>{{query}}</code>
+            <code style='color: #d63384;'>{{requirement_text}}</code>
+        </div>
+        <div style='background-color: #e8f4f8; padding: 10px; border-radius: 5px; margin: 10px 0;'>
+            <code style='color: #d63384;'>{{query}}</code> (legacy, also supported)
         </div>
         """, unsafe_allow_html=True)
 
     # Preview section
     with st.expander("👁️ Preview Breakdown Prompt with Sample Values", expanded=False):
         sample_query = "The system must do X and Y while monitoring Z."
-        preview_prompt = breakdown_prompt_template.replace("{{query}}", sample_query)
+        preview_prompt = breakdown_prompt_template.replace("{{requirement_text}}", sample_query)
+        preview_prompt = preview_prompt.replace("{{query}}", sample_query)
         st.text_area(
             "Preview:",
             value=preview_prompt[:2000] + ("..." if len(preview_prompt) > 2000 else ""),
@@ -796,14 +203,37 @@ def show_breakdown_tab(project_id: str):
             st.markdown("---")
             st.subheader("Results")
             st.markdown("### Breakdown Result")
-            st.info(breakdown_result)
+            
+            # Try to parse and display as JSON if possible
+            try:
+                breakdown_json = json.loads(breakdown_result)
+                st.json(breakdown_json)
+                
+                # Extract and display requirements if available
+                if "requirements" in breakdown_json:
+                    st.markdown("### Extracted Requirements:")
+                    for i, req in enumerate(breakdown_json["requirements"], 1):
+                        with st.expander(f"Requirement {i}: {req.get('id', f'REQ-{i}')}", expanded=False):
+                            if isinstance(req, dict):
+                                st.markdown(f"**Responsible Entity:** {req.get('responsible_entity', 'N/A')}")
+                                st.markdown(f"**Context:** {req.get('overarching_context', 'N/A')}")
+                                st.markdown(f"**Action:** {req.get('specific_action', 'N/A')}")
+                                st.markdown(f"**Detailed Requirement:** {req.get('detailed_requirement', 'N/A')}")
+                                st.markdown(f"**Success Criteria:** {req.get('success_criteria', 'N/A')}")
+                                st.markdown(f"**Compliance Statement:**")
+                                st.code(req.get('compliance_verification_statement', 'N/A'))
+                            else:
+                                st.text(str(req))
+            except json.JSONDecodeError:
+                # Not JSON, display as text
+                st.info(breakdown_result)
             
             # Download result
             st.download_button(
                 label="📥 Download Result",
                 data=breakdown_result,
-                file_name="breakdown_result.txt",
-                mime="text/plain",
+                file_name="breakdown_result.json" if breakdown_result.strip().startswith('{') else "breakdown_result.txt",
+                mime="application/json" if breakdown_result.strip().startswith('{') else "text/plain",
                 key="main_breakdown_result_download"
             )
             
@@ -824,24 +254,16 @@ def show_single_requirement_tab(project_id: str, top_k: int):
 
     # Callback for load
     def load_single():
-        # #region agent log
-        _log("B", "app.py:486", "load_single called", {})
-        # #endregion
+        log("B", "app.py", "load_single called", {})
         if "prompt_to_load" in st.session_state:
             selected = st.session_state.prompt_to_load
-            # #region agent log
-            _log("B", "app.py:489", "Attempting to load prompt", {"selected": selected, "available_keys": list(st.session_state.saved_prompts.keys())})
-            # #endregion
+            log("B", "app.py", "Attempting to load prompt", {"selected": selected, "available_keys": list(st.session_state.saved_prompts.keys())})
             try:
                 st.session_state.current_prompt = st.session_state.saved_prompts[selected]
                 st.session_state.prompt_editor = st.session_state.saved_prompts[selected]
-                # #region agent log
-                _log("B", "app.py:492", "Prompt loaded successfully", {"selected": selected})
-                # #endregion
+                log("B", "app.py", "Prompt loaded successfully", {"selected": selected})
             except KeyError as e:
-                # #region agent log
-                _log("B", "app.py:492", "KeyError loading prompt", {"selected": selected, "error": str(e)})
-                # #endregion
+                log("B", "app.py", "KeyError loading prompt", {"selected": selected, "error": str(e)})
                 raise
     
     # Prompt editor with enhanced UI
@@ -874,15 +296,11 @@ def show_single_requirement_tab(project_id: str, top_k: int):
         
         # Load logic
         prompt_names = list(st.session_state.saved_prompts.keys())
-        # #region agent log
-        _log("E", "app.py:524", "Initializing single prompt selectbox", {"options_count": len(prompt_names), "options": prompt_names})
-        # #endregion
+        log("E", "app.py", "Initializing single prompt selectbox", {"options_count": len(prompt_names), "options": prompt_names})
         if prompt_names:
             st.selectbox("📂 Load Saved Prompt", options=prompt_names, index=0, key="prompt_to_load")
         else:
-            # #region agent log
-            _log("E", "app.py:527", "Empty prompt_names list, using placeholder", {})
-            # #endregion
+            log("E", "app.py", "Empty prompt_names list, using placeholder", {})
             st.selectbox("📂 Load Saved Prompt", options=["No prompts available"], index=0, key="prompt_to_load", disabled=True)
         if st.button("📂 Load Selected", use_container_width=True, on_click=load_single):
             st.rerun()
@@ -940,6 +358,13 @@ def show_single_requirement_tab(project_id: str, top_k: int):
     # Requirement input
     st.subheader("Requirement Input & Testing")
     
+    # PDF Upload option
+    uploaded_pdf = st.file_uploader(
+        "📄 Upload PDF Document (Optional)",
+        type=["pdf"],
+        help="Upload a PDF document to extract text from. The extracted text will be used as the requirement to verify."
+    )
+    
     # Search method selection
     col1, col2 = st.columns([1, 2])
     with col1:
@@ -968,14 +393,33 @@ def show_single_requirement_tab(project_id: str, top_k: int):
     requirement_text = st.text_area(
         "Enter Requirement",
         height=100,
-        help="Enter the requirement to verify against the documents",
+        help="Enter the requirement to verify against the documents. If PDF is uploaded, this field can be used for additional context.",
         key="single_requirement_input"
     )
     
     if st.button("🚀 Process Requirement", type="primary", key="process_single"):
-        if not requirement_text:
-            st.warning("Please enter a requirement first.")
+        # Handle PDF upload
+        input_text = requirement_text
+        if uploaded_pdf:
+            st.info("📄 Processing PDF document...")
+            pdf_text = extract_text_from_pdf(uploaded_pdf)
+            if pdf_text:
+                # Combine PDF text with requirement text if provided
+                if requirement_text.strip():
+                    input_text = f"{requirement_text}\n\n--- PDF Document Content ---\n\n{pdf_text}"
+                else:
+                    input_text = pdf_text
+                st.success(f"✓ Extracted {len(pdf_text)} characters from PDF")
+            else:
+                st.error("Failed to extract text from PDF. Please try again.")
             return
+        
+        if not input_text or not input_text.strip():
+            st.warning("Please enter a requirement or upload a PDF document.")
+            return
+        
+        # Use input text directly as requirement
+        requirements_text = input_text
         
         # Decide which prompts to run
         if prompts_to_compare:
@@ -984,7 +428,7 @@ def show_single_requirement_tab(project_id: str, top_k: int):
             
             with st.spinner(f"Comparing {len(active_prompts)} prompts..."):
                 document_chunks_text, chunks_metadata = get_merged_chunks(
-                    requirement_text, 
+                    requirements_text, 
                     project_id, 
                     top_k,
                     search_method=search_method
@@ -1004,7 +448,7 @@ def show_single_requirement_tab(project_id: str, top_k: int):
                     with cols[i]:
                         st.markdown(f"#### Prompt: {name}")
                         result, _ = process_requirement_with_chunks(
-                            requirement=requirement_text,
+                            requirement=requirements_text,
                             document_chunks_text=document_chunks_text,
                             chunks_metadata=chunks_metadata,
                             prompt_template=template
@@ -1014,7 +458,7 @@ def show_single_requirement_tab(project_id: str, top_k: int):
             # Run single (current) prompt
             with st.spinner("Processing requirement..."):
                 result, chunks_metadata = process_requirement(
-                    requirement=requirement_text,
+                    requirement=requirements_text,
                     project_id=project_id,
                     prompt_template=prompt_template,
                     top_k=top_k,
@@ -1099,24 +543,16 @@ def show_csv_batch_tab(project_id: str, top_k: int):
 
     # Callback for load
     def load_batch():
-        # #region agent log
-        _log("B", "app.py:709", "load_batch called", {})
-        # #endregion
+        log("B", "app.py", "load_batch called", {})
         if "batch_prompt_to_load" in st.session_state:
             selected = st.session_state.batch_prompt_to_load
-            # #region agent log
-            _log("B", "app.py:712", "Attempting to load batch prompt", {"selected": selected, "available_keys": list(st.session_state.saved_prompts.keys())})
-            # #endregion
+            log("B", "app.py", "Attempting to load batch prompt", {"selected": selected, "available_keys": list(st.session_state.saved_prompts.keys())})
             try:
                 st.session_state.current_prompt = st.session_state.saved_prompts[selected]
                 st.session_state.batch_prompt_editor = st.session_state.saved_prompts[selected]
-                # #region agent log
-                _log("B", "app.py:715", "Batch prompt loaded successfully", {"selected": selected})
-                # #endregion
+                log("B", "app.py", "Batch prompt loaded successfully", {"selected": selected})
             except KeyError as e:
-                # #region agent log
-                _log("B", "app.py:715", "KeyError loading batch prompt", {"selected": selected, "error": str(e)})
-                # #endregion
+                log("B", "app.py", "KeyError loading batch prompt", {"selected": selected, "error": str(e)})
                 raise
     
     # Prompt editor for batch processing with enhanced UI
@@ -1145,15 +581,11 @@ def show_csv_batch_tab(project_id: str, top_k: int):
         
         # Load logic
         prompt_names = list(st.session_state.saved_prompts.keys())
-        # #region agent log
-        _log("E", "app.py:740", "Initializing batch prompt selectbox", {"options_count": len(prompt_names), "options": prompt_names})
-        # #endregion
+        log("E", "app.py", "Initializing batch prompt selectbox", {"options_count": len(prompt_names), "options": prompt_names})
         if prompt_names:
             st.selectbox("📂 Load Saved Prompt", options=prompt_names, index=0, key="batch_prompt_to_load")
         else:
-            # #region agent log
-            _log("E", "app.py:743", "Empty prompt_names list for batch, using placeholder", {})
-            # #endregion
+            log("E", "app.py", "Empty prompt_names list for batch, using placeholder", {})
             st.selectbox("📂 Load Saved Prompt", options=["No prompts available"], index=0, key="batch_prompt_to_load", disabled=True)
         if st.button("📂 Load Selected", key="load_batch_btn", use_container_width=True, on_click=load_batch):
             st.rerun()
@@ -1225,9 +657,7 @@ def show_csv_batch_tab(project_id: str, top_k: int):
                 chunks_metadata_list.append([])
             else:
                 # Process requirement
-                # #region agent log
-                _log("G", "app.py:795", "Processing CSV row", {"row_idx": idx, "requirement_preview": requirement[:50]})
-                # #endregion
+                log("G", "app.py", "Processing CSV row", {"row_idx": idx, "requirement_preview": requirement[:50]})
                 try:
                     result, chunks_metadata = process_requirement(
                         requirement=requirement,
@@ -1238,13 +668,9 @@ def show_csv_batch_tab(project_id: str, top_k: int):
                     )
                     results_data.append(result)
                     chunks_metadata_list.append(chunks_metadata)
-                    # #region agent log
-                    _log("G", "app.py:804", "CSV row processed successfully", {"row_idx": idx, "status": result.get("status")})
-                    # #endregion
+                    log("G", "app.py", "CSV row processed successfully", {"row_idx": idx, "status": result.get("status")})
                 except Exception as e:
-                    # #region agent log
-                    _log("G", "app.py:807", "CSV row processing failed", {"row_idx": idx, "error": str(e), "traceback": traceback.format_exc()})
-                    # #endregion
+                    log("G", "app.py", "CSV row processing failed", {"row_idx": idx, "error": str(e), "traceback": traceback.format_exc()})
                     results_data.append({
                         "status": "ERROR",
                         "relevance_score": 0,
@@ -1359,6 +785,404 @@ def show_csv_batch_tab(project_id: str, top_k: int):
                 use_container_width=True,
                 help="Download the complete results as JSON"
             )
+
+
+def show_tender_check_tab():
+    """Show tender checking tab with multi-agent system."""
+    st.header("📄 Tender Submission Checker")
+    st.markdown("Multi-agent system for checking tender submissions against reference documents and guidelines.")
+    
+    # Initialize session state for tender checker prompts
+    if "tender_breakdown_prompt" not in st.session_state:
+        st.session_state.tender_breakdown_prompt = BREAKDOWN_AGENT_PROMPT
+    if "tender_omission_prompt" not in st.session_state:
+        st.session_state.tender_omission_prompt = OMISSION_CHECKER_PROMPT
+    if "tender_contradiction_prompt" not in st.session_state:
+        st.session_state.tender_contradiction_prompt = CONTRADICTION_CHECKER_PROMPT
+    if "tender_orchestrator_prompt" not in st.session_state:
+        st.session_state.tender_orchestrator_prompt = ORCHESTRATOR_PROMPT
+    
+    # Project ID selection for tender checker
+    st.markdown("---")
+    st.subheader("📁 Project Configuration")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        PROJECT_OPTIONS = {
+            "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
+            "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
+            "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63"
+        }
+        
+        reference_project = st.selectbox(
+            "Reference Documents Project",
+            options=list(PROJECT_OPTIONS.keys()),
+            index=0,
+            help="Project ID for reference documents (used for omission checking)",
+            key="tender_reference_project"
+        )
+        reference_project_id = PROJECT_OPTIONS[reference_project]
+    
+    with col2:
+        guidelines_project = st.selectbox(
+            "Guidelines Project",
+            options=list(PROJECT_OPTIONS.keys()),
+            index=0,
+            help="Project ID for guidelines (used for contradiction checking). If same as reference, leave as is.",
+            key="tender_guidelines_project"
+        )
+        guidelines_project_id = PROJECT_OPTIONS[guidelines_project]
+    
+    # Advanced settings
+    with st.expander("⚙️ Advanced Settings", expanded=False):
+        top_k = st.slider(
+            "Chunks per Requirement (top_k)",
+            min_value=3,
+            max_value=15,
+            value=8,
+            help="Number of document chunks to retrieve per requirement",
+            key="tender_top_k"
+        )
+        max_workers = st.slider(
+            "Parallel Workers",
+            min_value=1,
+            max_value=10,
+            value=5,
+            help="Number of parallel workers for requirement checking",
+            key="tender_max_workers"
+        )
+    
+    st.markdown("---")
+    
+    # Agent Prompts Configuration
+    st.subheader("🤖 Agent Prompts Configuration")
+    
+    prompt_tabs = st.tabs([
+        "1️⃣ Breakdown Agent",
+        "2️⃣ Omission Checker",
+        "3️⃣ Contradiction Checker",
+        "4️⃣ Orchestrator"
+    ])
+    
+    with prompt_tabs[0]:
+        st.markdown("**Breakdown Agent** - Extracts requirements from tender document")
+        breakdown_prompt = st.text_area(
+            "Breakdown Prompt Template",
+            value=st.session_state.tender_breakdown_prompt,
+            height=300,
+            help="Use {{tender_text}} as placeholder",
+            key="tender_breakdown_prompt_editor"
+        )
+        st.session_state.tender_breakdown_prompt = breakdown_prompt
+        if st.button("🔄 Reset to Default", key="reset_breakdown_tender"):
+            st.session_state.tender_breakdown_prompt = BREAKDOWN_AGENT_PROMPT
+            st.rerun()
+    
+    with prompt_tabs[1]:
+        st.markdown("**Omission Checker** - Checks if requirements are fulfilled")
+        omission_prompt = st.text_area(
+            "Omission Checker Prompt Template",
+            value=st.session_state.tender_omission_prompt,
+            height=300,
+            help="Use {{requirement_text}}, {{requirement_id}}, {{reference_chunks}} as placeholders",
+            key="omission_prompt_editor"
+        )
+        st.session_state.tender_omission_prompt = omission_prompt
+        if st.button("🔄 Reset to Default", key="reset_omission_tender"):
+            st.session_state.tender_omission_prompt = OMISSION_CHECKER_PROMPT
+            st.rerun()
+    
+    with prompt_tabs[2]:
+        st.markdown("**Contradiction Checker** - Checks for contradictions with guidelines")
+        contradiction_prompt = st.text_area(
+            "Contradiction Checker Prompt Template",
+            value=st.session_state.tender_contradiction_prompt,
+            height=300,
+            help="Use {{requirement_text}}, {{requirement_id}}, {{reference_chunks}} as placeholders",
+            key="contradiction_prompt_editor"
+        )
+        st.session_state.tender_contradiction_prompt = contradiction_prompt
+        if st.button("🔄 Reset to Default", key="reset_contradiction_tender"):
+            st.session_state.tender_contradiction_prompt = CONTRADICTION_CHECKER_PROMPT
+            st.rerun()
+    
+    with prompt_tabs[3]:
+        st.markdown("**Orchestrator** - Synthesizes final compliance report")
+        orchestrator_prompt = st.text_area(
+            "Orchestrator Prompt Template",
+            value=st.session_state.tender_orchestrator_prompt,
+            height=300,
+            help="Use {{tender_summary}}, {{omission_results}}, {{contradiction_results}} as placeholders",
+            key="orchestrator_prompt_editor"
+        )
+        st.session_state.tender_orchestrator_prompt = orchestrator_prompt
+        if st.button("🔄 Reset to Default", key="reset_orchestrator_tender"):
+            st.session_state.tender_orchestrator_prompt = ORCHESTRATOR_PROMPT
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Document Upload
+    st.subheader("📄 Upload Tender Document")
+    
+    uploaded_pdf = st.file_uploader(
+        "Upload Tender PDF",
+        type=["pdf"],
+        help="Upload the tender submission document to check",
+        key="tender_pdf_upload"
+    )
+    
+    if uploaded_pdf:
+        st.success(f"✓ PDF uploaded: {uploaded_pdf.name}")
+    
+    st.markdown("---")
+    
+    # Process Button
+    if st.button("🚀 Check Tender Submission", type="primary", key="check_tender_btn"):
+        if not uploaded_pdf:
+            st.error("Please upload a PDF document first.")
+            return
+        
+        # Extract text from PDF
+        with st.spinner("Extracting text from PDF..."):
+            tender_text = extract_text_from_pdf(uploaded_pdf)
+            if not tender_text:
+                st.error("Failed to extract text from PDF. Please try again.")
+                return
+            st.success(f"✓ Extracted {len(tender_text)} characters from PDF")
+        
+        # Initialize workflow
+        try:
+            workflow = TenderCheckWorkflow(
+                ai_client=st.session_state.ai_client,
+                supabase_client=st.session_state.supabase_client,
+                breakdown_prompt=st.session_state.tender_breakdown_prompt,
+                omission_prompt=st.session_state.tender_omission_prompt,
+                contradiction_prompt=st.session_state.tender_contradiction_prompt,
+                orchestrator_prompt=st.session_state.tender_orchestrator_prompt
+            )
+        except Exception as e:
+            st.error(f"Failed to initialize workflow: {str(e)}")
+            return
+        
+        # Run workflow with progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            status_text.text("🔄 Step 1/4: Breaking down tender into requirements...")
+            progress_bar.progress(25)
+            
+            # Run workflow
+            result = workflow.run(
+                tender_text=tender_text,
+                project_id=reference_project_id,
+                guidelines_project_id=guidelines_project_id if guidelines_project_id != reference_project_id else None,
+                top_k=top_k
+            )
+            
+            progress_bar.progress(100)
+            status_text.empty()
+            progress_bar.empty()
+            
+            # Store result in session state
+            st.session_state.tender_check_result = result
+            
+        except Exception as e:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"Error during tender checking: {str(e)}")
+            import traceback
+            with st.expander("Error Details"):
+                st.code(traceback.format_exc())
+            return
+    
+    # Display Results
+    if "tender_check_result" in st.session_state:
+        result = st.session_state.tender_check_result
+        
+        st.markdown("---")
+        st.subheader("📊 Tender Check Results")
+        
+        # Overall Status
+        final_report = result.get("final_report", {})
+        overall_status = final_report.get("overall_status", "UNKNOWN")
+        compliance_score = final_report.get("compliance_score", 0.0)
+        
+        # Status badge
+        if overall_status == "COMPLIANT":
+            st.success(f"✅ **Overall Status:** {overall_status} | **Compliance Score:** {compliance_score:.2%}")
+        elif overall_status == "CONDITIONALLY_COMPLIANT":
+            st.warning(f"⚠️ **Overall Status:** {overall_status} | **Compliance Score:** {compliance_score:.2%}")
+        else:
+            st.error(f"❌ **Overall Status:** {overall_status} | **Compliance Score:** {compliance_score:.2%}")
+        
+        # Summary
+        st.markdown("### Executive Summary")
+        st.info(final_report.get("summary", "No summary available"))
+        
+        # Requirements Breakdown
+        requirements = result.get("requirements", [])
+        if requirements:
+            st.markdown("### 📋 Extracted Requirements")
+            st.write(f"**Total Requirements:** {len(requirements)}")
+            with st.expander("View All Requirements", expanded=False):
+                for i, req in enumerate(requirements, 1):
+                    st.markdown(f"**{req.get('id', f'REQ-{i}')}** ({req.get('category', 'N/A')})")
+                    st.caption(req.get('requirement_text', '')[:200] + "...")
+        
+        # Omission Summary
+        omission_summary = final_report.get("omission_summary", {})
+        if omission_summary:
+            st.markdown("### ✅ Omission Check Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total", omission_summary.get("total_requirements", 0))
+            with col2:
+                st.metric("Fulfilled", omission_summary.get("fulfilled", 0), delta=None)
+            with col3:
+                st.metric("Partially Fulfilled", omission_summary.get("partially_fulfilled", 0))
+            with col4:
+                st.metric("Not Fulfilled", omission_summary.get("not_fulfilled", 0), delta=None)
+            
+            missing = omission_summary.get("missing_requirements", [])
+            if missing:
+                with st.expander("Missing Requirements", expanded=True):
+                    for req in missing:
+                        st.write(f"- {req}")
+        
+        # Contradiction Summary
+        contradiction_summary = final_report.get("contradiction_summary", {})
+        if contradiction_summary:
+            st.markdown("### ⚠️ Contradiction Check Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Checked", contradiction_summary.get("total_checked", 0))
+            with col2:
+                st.metric("Critical", contradiction_summary.get("critical_contradictions", 0), delta=None, delta_color="inverse")
+            with col3:
+                st.metric("Moderate", contradiction_summary.get("moderate_contradictions", 0), delta=None, delta_color="inverse")
+            with col4:
+                st.metric("Minor", contradiction_summary.get("minor_contradictions", 0), delta=None, delta_color="inverse")
+            
+            contradictions = contradiction_summary.get("contradictions", [])
+            if contradictions:
+                with st.expander("Contradictions Found", expanded=True):
+                    for cont in contradictions:
+                        st.write(f"- {cont}")
+        
+        # Critical Issues
+        critical_issues = final_report.get("critical_issues", [])
+        if critical_issues:
+            st.markdown("### 🚨 Critical Issues")
+            for issue in critical_issues:
+                severity_color = {
+                    "CRITICAL": "🔴",
+                    "MODERATE": "🟡",
+                    "MINOR": "🟢"
+                }.get(issue.get("severity", ""), "⚪")
+                
+                st.markdown(f"{severity_color} **{issue.get('requirement_id', 'N/A')}** - {issue.get('issue_type', 'N/A')}")
+                st.caption(issue.get("description", ""))
+                st.caption(f"**Impact:** {issue.get('impact', 'N/A')}")
+        
+        # Recommendations
+        recommendations = final_report.get("recommendations", [])
+        if recommendations:
+            st.markdown("### 💡 Recommendations")
+            for rec in recommendations:
+                priority_icon = {
+                    "HIGH": "🔴",
+                    "MEDIUM": "🟡",
+                    "LOW": "🟢"
+                }.get(rec.get("priority", ""), "⚪")
+                
+                st.markdown(f"{priority_icon} **{rec.get('requirement_id', 'N/A')}** - {rec.get('action', '')}")
+        
+        # Risk Assessment
+        risk_assessment = final_report.get("risk_assessment", "")
+        if risk_assessment:
+            st.markdown("### 📊 Risk Assessment")
+            st.info(risk_assessment)
+        
+        # Detailed Results
+        with st.expander("📄 View Detailed Results (JSON)", expanded=False):
+            st.json(result)
+        
+        # Download Results
+        st.markdown("---")
+        result_json = json.dumps(result, indent=2)
+        st.download_button(
+            label="📥 Download Full Results (JSON)",
+            data=result_json,
+            file_name="tender_check_results.json",
+            mime="application/json",
+            key="download_tender_results"
+        )
+
+
+def main():
+    """Main Streamlit app."""
+    st.set_page_config(
+        page_title="Requirement Checker",
+        page_icon="📋",
+        layout="wide"
+    )
+    
+    st.title("📋 Requirement Checker")
+    st.markdown("---")
+    
+    # Project ID selection (global setting)
+    PROJECT_OPTIONS = {
+        "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
+        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
+        "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63"
+    }
+    
+    selected_project = st.sidebar.selectbox(
+        "Project",
+        options=list(PROJECT_OPTIONS.keys()),
+        index=0,  # Default to "Building services"
+        help="Select the project to check requirements against documents in Supabase",
+        key="project_selection"
+    )
+    
+    # Get the actual project ID from the selection
+    project_id = PROJECT_OPTIONS[selected_project]
+    
+    # Set top_k to default value of 5
+    top_k = 5
+    
+    # Reset button in sidebar
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🔄 Reset App Session", help="Clear all session state and reload"):
+        for key in st.session_state.keys():
+            del st.session_state[key]
+        st.rerun()
+    
+    if not project_id:
+        st.info("👈 Please enter a Project ID in the sidebar to continue.")
+        return
+    
+    # Create tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 Single Requirement", 
+        "📊 CSV Batch Processing", 
+        "✂️ Requirement Breakdown",
+        "📄 Tender Checker"
+    ])
+    
+    with tab1:
+        show_single_requirement_tab(project_id, top_k)
+    
+    with tab2:
+        show_csv_batch_tab(project_id, top_k)
+
+    with tab3:
+        show_breakdown_tab(project_id)
+    
+    with tab4:
+        show_tender_check_tab()
 
 
 if __name__ == "__main__":

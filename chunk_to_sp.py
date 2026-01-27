@@ -210,12 +210,12 @@ class ChunkrToSupabase:
             # Removed timestamp fields: 'created_at', 'finished_at', 'started_at'
             # These columns don't exist in the schema
         }
-
+        
         # Only add optional fields if they have values
         for key, value in optional_fields.items():
             if value is not None:
                 task_record[key] = value
-
+        
         try:
             (
                 self.supabase
@@ -519,11 +519,11 @@ class ChunkrToSupabase:
                 
                 if confirmation in ['yes', 'y']:
                     print(f"\n✓ Confirmed. Deleting existing chunks for: {file_name_for_delete}")
-                    self.delete_existing_chunks(
-                        organization_id=knowledge.get('organization_id'),
-                        project_id=knowledge.get('project_id'),
-                        file_name=file_name_for_delete
-                    )
+            self.delete_existing_chunks(
+                organization_id=knowledge.get('organization_id'),
+                project_id=knowledge.get('project_id'),
+                file_name=file_name_for_delete
+            )
                 else:
                     print(f"\n⚠ Deletion cancelled. Proceeding without deleting existing chunks.")
                     print("   Note: This may result in duplicate chunks if the file already exists.")

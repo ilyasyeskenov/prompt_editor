@@ -1,8 +1,8 @@
 """Supabase client for RAG operations - matches original TypeScript implementation."""
 from supabase import create_client, Client
 from typing import List, Dict, Any, Optional
-from config.config import SUPABASE_URL, SUPABASE_ANON_KEY
-from clients.ai_client import AIClient
+from prompt_editor.config.config import SUPABASE_URL, SUPABASE_ANON_KEY
+from prompt_editor.clients.ai_client import AIClient
 
 
 class SupabaseClient:
