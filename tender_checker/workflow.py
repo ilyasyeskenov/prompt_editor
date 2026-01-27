@@ -96,7 +96,7 @@ class TenderCheckWorkflow:
         try:
             requirements = state.get("requirements", [])
             if not requirements:
-                return {"omission_results": [], "error": ""}
+                return {"omission_results": []}
             
             # Check all requirements
             top_k = state.get("top_k", 8)
@@ -106,11 +106,18 @@ class TenderCheckWorkflow:
                 top_k=top_k,
                 search_method="hybrid"
             )
-            return {"omission_results": results, "error": ""}
+            return {"omission_results": results}
         except Exception as e:
+            # Include error in results instead of separate error key
             return {
-                "omission_results": [],
-                "error": f"Omission check error: {str(e)}"
+                "omission_results": [{
+                    "requirement_id": "ERROR",
+                    "status": "ERROR",
+                    "confidence": 0.0,
+                    "justification": f"Omission check error: {str(e)}",
+                    "citations": [],
+                    "missing_elements": []
+                }]
             }
     
     def _contradiction_check_node(self, state: TenderCheckState) -> Dict[str, Any]:
@@ -118,7 +125,7 @@ class TenderCheckWorkflow:
         try:
             requirements = state.get("requirements", [])
             if not requirements:
-                return {"contradiction_results": [], "error": ""}
+                return {"contradiction_results": []}
             
             # Use guidelines_project_id for contradiction checking
             guidelines_id = state.get("guidelines_project_id", state["project_id"])
@@ -131,11 +138,20 @@ class TenderCheckWorkflow:
                 top_k=top_k,
                 search_method="hybrid"
             )
-            return {"contradiction_results": results, "error": ""}
+            return {"contradiction_results": results}
         except Exception as e:
+            # Include error in results instead of separate error key
             return {
-                "contradiction_results": [],
-                "error": f"Contradiction check error: {str(e)}"
+                "contradiction_results": [{
+                    "requirement_id": "ERROR",
+                    "has_contradiction": False,
+                    "severity": "ERROR",
+                    "contradiction_details": f"Contradiction check error: {str(e)}",
+                    "reference_guideline": "",
+                    "tender_statement": "",
+                    "citations": [],
+                    "recommendation": ""
+                }]
             }
     
     def _orchestrate_node(self, state: TenderCheckState) -> Dict[str, Any]:
@@ -156,13 +172,21 @@ class TenderCheckWorkflow:
                 # Return empty dict, will be called again
                 return {}
             
+            # Check for errors in results and aggregate them
+            errors = []
+            if state.get("error"):
+                errors.append(state["error"])
+            
             # Both checkers have completed, synthesize results
             final_report = self.orchestrator.synthesize_results(
                 tender_summary=state.get("tender_summary", ""),
                 omission_results=omission_results or [],
                 contradiction_results=contradiction_results or []
             )
-            return {"final_report": final_report, "error": ""}
+            
+            # Combine any errors
+            error_msg = "; ".join(errors) if errors else ""
+            return {"final_report": final_report, "error": error_msg}
         except Exception as e:
             return {
                 "final_report": {
