@@ -1,8 +1,8 @@
 """Orchestrator agent - synthesizes results from all checkers."""
 import json
 from typing import Dict, Any, List
-from prompt_editor.clients.ai_client import AIClient
-from prompt_editor.tender_checker.prompts.agent_prompts import ORCHESTRATOR_PROMPT
+from clients.ai_client import AIClient
+from tender_checker.prompts.agent_prompts import ORCHESTRATOR_PROMPT
 
 
 class OrchestratorAgent:

@@ -2,9 +2,9 @@
 import json
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from prompt_editor.clients.ai_client import AIClient
-from prompt_editor.clients.supabase_client import SupabaseClient
-from prompt_editor.tender_checker.prompts.agent_prompts import OMISSION_CHECKER_PROMPT
+from clients.ai_client import AIClient
+from clients.supabase_client import SupabaseClient
+from tender_checker.prompts.agent_prompts import OMISSION_CHECKER_PROMPT
 
 class OmissionCheckerAgent:
     """Agent that checks for omissions using RAG search."""

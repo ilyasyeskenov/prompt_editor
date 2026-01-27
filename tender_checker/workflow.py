@@ -1,12 +1,12 @@
 """LangGraph workflow for tender checking multi-agent system."""
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
-from prompt_editor.clients.ai_client import AIClient
-from prompt_editor.clients.supabase_client import SupabaseClient
-from prompt_editor.tender_checker.agents.breakdown_agent import BreakdownAgent
-from prompt_editor.tender_checker.agents.omission_checker_agent import OmissionCheckerAgent
-from prompt_editor.tender_checker.agents.contradiction_checker_agent import ContradictionCheckerAgent
-from prompt_editor.tender_checker.agents.orchestrator_agent import OrchestratorAgent
+from clients.ai_client import AIClient
+from clients.supabase_client import SupabaseClient
+from tender_checker.agents.breakdown_agent import BreakdownAgent
+from tender_checker.agents.omission_checker_agent import OmissionCheckerAgent
+from tender_checker.agents.contradiction_checker_agent import ContradictionCheckerAgent
+from tender_checker.agents.orchestrator_agent import OrchestratorAgent
 
 
 class TenderCheckState(TypedDict):
@@ -86,9 +86,9 @@ class TenderCheckWorkflow:
             }
         except Exception as e:
             return {
-                "error": f"Breakdown error: {str(e)}",
                 "requirements": [],
-                "tender_summary": ""
+                "tender_summary": "",
+                "error": f"Breakdown error: {str(e)}"
             }
     
     def _omission_check_node(self, state: TenderCheckState) -> Dict[str, Any]:
@@ -96,7 +96,7 @@ class TenderCheckWorkflow:
         try:
             requirements = state.get("requirements", [])
             if not requirements:
-                return {"omission_results": []}
+                return {"omission_results": [], "error": ""}
             
             # Check all requirements
             top_k = state.get("top_k", 8)
@@ -106,11 +106,11 @@ class TenderCheckWorkflow:
                 top_k=top_k,
                 search_method="hybrid"
             )
-            return {"omission_results": results}
+            return {"omission_results": results, "error": ""}
         except Exception as e:
             return {
-                "error": f"Omission check error: {str(e)}",
-                "omission_results": []
+                "omission_results": [],
+                "error": f"Omission check error: {str(e)}"
             }
     
     def _contradiction_check_node(self, state: TenderCheckState) -> Dict[str, Any]:
@@ -118,7 +118,7 @@ class TenderCheckWorkflow:
         try:
             requirements = state.get("requirements", [])
             if not requirements:
-                return {"contradiction_results": []}
+                return {"contradiction_results": [], "error": ""}
             
             # Use guidelines_project_id for contradiction checking
             guidelines_id = state.get("guidelines_project_id", state["project_id"])
@@ -131,11 +131,11 @@ class TenderCheckWorkflow:
                 top_k=top_k,
                 search_method="hybrid"
             )
-            return {"contradiction_results": results}
+            return {"contradiction_results": results, "error": ""}
         except Exception as e:
             return {
-                "error": f"Contradiction check error: {str(e)}",
-                "contradiction_results": []
+                "contradiction_results": [],
+                "error": f"Contradiction check error: {str(e)}"
             }
     
     def _orchestrate_node(self, state: TenderCheckState) -> Dict[str, Any]:
@@ -162,14 +162,14 @@ class TenderCheckWorkflow:
                 omission_results=omission_results or [],
                 contradiction_results=contradiction_results or []
             )
-            return {"final_report": final_report}
+            return {"final_report": final_report, "error": ""}
         except Exception as e:
             return {
-                "error": f"Orchestration error: {str(e)}",
                 "final_report": {
                     "overall_status": "ERROR",
                     "summary": f"Error: {str(e)}"
-                }
+                },
+                "error": f"Orchestration error: {str(e)}"
             }
     
     def run(

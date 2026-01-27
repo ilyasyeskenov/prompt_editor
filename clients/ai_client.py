@@ -1,7 +1,7 @@
 """OpenAI client for AI operations."""
 from openai import OpenAI
 from typing import List
-from prompt_editor.config.config import OPENAI_API_KEY, OPENAI_MODEL, EMBEDDING_MODEL
+from config.config import OPENAI_API_KEY, OPENAI_MODEL, EMBEDDING_MODEL
 
 
 class AIClient:
