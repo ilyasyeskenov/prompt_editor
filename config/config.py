@@ -19,7 +19,7 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 CHUNK_SIZE = 1000  # Characters per chunk
 CHUNK_OVERLAP = 200  # Overlap between chunks
 BATCH_SIZE = 3  # Number of requirements to process in parallel
-TOP_K_CHUNKS = 8  # Number of document chunks to retrieve per requirement
+TOP_K_CHUNKS = 5  # Default number of document chunks to retrieve per requirement
 
 # Data Storage
 DATA_DIR = "data"

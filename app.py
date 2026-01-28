@@ -801,6 +801,31 @@ def show_tender_check_tab():
         st.session_state.tender_contradiction_prompt = CONTRADICTION_CHECKER_PROMPT
     if "tender_orchestrator_prompt" not in st.session_state:
         st.session_state.tender_orchestrator_prompt = ORCHESTRATOR_PROMPT
+
+    # Apply any queued prompt loads before rendering widgets so the UI reflects them
+    if "tender_breakdown_prompt_to_apply" in st.session_state:
+        new_val = st.session_state.tender_breakdown_prompt_to_apply
+        st.session_state["tender_breakdown_prompt_editor"] = new_val
+        st.session_state.tender_breakdown_prompt = new_val
+        del st.session_state.tender_breakdown_prompt_to_apply
+
+    if "tender_omission_prompt_to_apply" in st.session_state:
+        new_val = st.session_state.tender_omission_prompt_to_apply
+        st.session_state["omission_prompt_editor"] = new_val
+        st.session_state.tender_omission_prompt = new_val
+        del st.session_state.tender_omission_prompt_to_apply
+
+    if "tender_contradiction_prompt_to_apply" in st.session_state:
+        new_val = st.session_state.tender_contradiction_prompt_to_apply
+        st.session_state["contradiction_prompt_editor"] = new_val
+        st.session_state.tender_contradiction_prompt = new_val
+        del st.session_state.tender_contradiction_prompt_to_apply
+
+    if "tender_orchestrator_prompt_to_apply" in st.session_state:
+        new_val = st.session_state.tender_orchestrator_prompt_to_apply
+        st.session_state["orchestrator_prompt_editor"] = new_val
+        st.session_state.tender_orchestrator_prompt = new_val
+        del st.session_state.tender_orchestrator_prompt_to_apply
     
     # Project ID selection for tender checker
     st.markdown("---")
@@ -817,7 +842,7 @@ def show_tender_check_tab():
         reference_project = st.selectbox(
             "Reference Documents Project",
             options=list(PROJECT_OPTIONS.keys()),
-            index=0,
+            index=2,  # Default to 'Tender Requirement-2'
             help="Project ID for reference documents (used for omission checking)",
             key="tender_reference_project"
         )
@@ -827,7 +852,7 @@ def show_tender_check_tab():
         guidelines_project = st.selectbox(
             "Guidelines Project",
             options=list(PROJECT_OPTIONS.keys()),
-            index=0,
+            index=2,  # Default to 'Tender Requirement-2'
             help="Project ID for guidelines (used for contradiction checking). If same as reference, leave as is.",
             key="tender_guidelines_project"
         )
@@ -839,7 +864,7 @@ def show_tender_check_tab():
             "Chunks per Requirement (top_k)",
             min_value=3,
             max_value=15,
-            value=8,
+            value=5,
             help="Number of document chunks to retrieve per requirement",
             key="tender_top_k"
         )
@@ -868,7 +893,7 @@ def show_tender_check_tab():
         st.markdown("**Breakdown Agent** - Extracts requirements from tender document")
         breakdown_prompt = st.text_area(
             "Breakdown Prompt Template",
-            value=st.session_state.tender_breakdown_prompt,
+            value=st.session_state.get("tender_breakdown_prompt_editor", st.session_state.tender_breakdown_prompt),
             height=300,
             help="Use {{tender_text}} as placeholder",
             key="tender_breakdown_prompt_editor"
@@ -877,12 +902,85 @@ def show_tender_check_tab():
         if st.button("🔄 Reset to Default", key="reset_breakdown_tender"):
             st.session_state.tender_breakdown_prompt = BREAKDOWN_AGENT_PROMPT
             st.rerun()
+        
+        # Manage saved Breakdown prompts (tender-specific, compact UI)
+        with st.expander("💾 Manage Breakdown Prompts", expanded=False):
+            if "tender_saved_breakdown_prompts" not in st.session_state:
+                st.session_state.tender_saved_breakdown_prompts = {"Default Tender Breakdown": BREAKDOWN_AGENT_PROMPT}
+                try:
+                    db_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="tender_breakdown")
+                    for p in db_prompts:
+                        st.session_state.tender_saved_breakdown_prompts[p["name"]] = p["prompt_text"]
+                except Exception:
+                    pass
+            breakdown_names = list(st.session_state.tender_saved_breakdown_prompts.keys())
+            if breakdown_names:
+                selected_breakdown = st.selectbox(
+                    "📂 Load Saved",
+                    options=breakdown_names,
+                    index=0,
+                    key="tender_breakdown_prompt_to_load",
+                )
+            else:
+                selected_breakdown = None
+                st.selectbox(
+                    "📂 Load Saved",
+                    options=["No prompts available"],
+                    index=0,
+                    key="tender_breakdown_prompt_to_load",
+                    disabled=True,
+                )
+            load_col, update_col = st.columns(2)
+            with load_col:
+                if st.button("Load Selected", key="load_tender_breakdown_prompt"):
+                    if selected_breakdown:
+                        # Queue value to apply on next run so widget state updates correctly
+                        st.session_state.tender_breakdown_prompt_to_apply = st.session_state.tender_saved_breakdown_prompts[selected_breakdown]
+                        st.rerun()
+            new_breakdown_name = st.text_input(
+                "New name",
+                key="new_tender_breakdown_name",
+                placeholder="e.g., Tender Breakdown V2",
+            )
+            with update_col:
+                if st.button("Update Selected", key="update_tender_breakdown_prompt"):
+                    if selected_breakdown:
+                        success = st.session_state.supabase_client.save_prompt(
+                            name=selected_breakdown,
+                            prompt_text=breakdown_prompt,
+                            project_id=reference_project_id if reference_project_id else None,
+                            prompt_type="tender_breakdown",
+                        )
+                        if success:
+                            st.session_state.tender_saved_breakdown_prompts[selected_breakdown] = breakdown_prompt
+                            st.success("Updated tender breakdown prompt.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update tender breakdown prompt.")
+                    else:
+                        st.error("Select a prompt to update.")
+            if st.button("Save Current", key="save_tender_breakdown_prompt"):
+                if new_breakdown_name:
+                    success = st.session_state.supabase_client.save_prompt(
+                        name=new_breakdown_name,
+                        prompt_text=breakdown_prompt,
+                        project_id=reference_project_id if reference_project_id else None,
+                        prompt_type="tender_breakdown",
+                    )
+                    if success:
+                        st.session_state.tender_saved_breakdown_prompts[new_breakdown_name] = breakdown_prompt
+                        st.success("Saved tender breakdown prompt.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to save tender breakdown prompt.")
+                else:
+                    st.error("Enter a name for the breakdown prompt.")
     
     with prompt_tabs[1]:
         st.markdown("**Omission Checker** - Checks if requirements are fulfilled")
         omission_prompt = st.text_area(
             "Omission Checker Prompt Template",
-            value=st.session_state.tender_omission_prompt,
+            value=st.session_state.get("omission_prompt_editor", st.session_state.tender_omission_prompt),
             height=300,
             help="Use {{requirement_text}}, {{requirement_id}}, {{reference_chunks}} as placeholders",
             key="omission_prompt_editor"
@@ -891,12 +989,84 @@ def show_tender_check_tab():
         if st.button("🔄 Reset to Default", key="reset_omission_tender"):
             st.session_state.tender_omission_prompt = OMISSION_CHECKER_PROMPT
             st.rerun()
+        
+        # Manage saved Omission prompts (tender-specific, compact UI)
+        with st.expander("💾 Manage Omission Prompts", expanded=False):
+            if "tender_saved_omission_prompts" not in st.session_state:
+                st.session_state.tender_saved_omission_prompts = {"Default Tender Omission": OMISSION_CHECKER_PROMPT}
+                try:
+                    db_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="tender_omission")
+                    for p in db_prompts:
+                        st.session_state.tender_saved_omission_prompts[p["name"]] = p["prompt_text"]
+                except Exception:
+                    pass
+            omission_names = list(st.session_state.tender_saved_omission_prompts.keys())
+            if omission_names:
+                selected_omission = st.selectbox(
+                    "📂 Load Saved",
+                    options=omission_names,
+                    index=0,
+                    key="tender_omission_prompt_to_load",
+                )
+            else:
+                selected_omission = None
+                st.selectbox(
+                    "📂 Load Saved",
+                    options=["No prompts available"],
+                    index=0,
+                    key="tender_omission_prompt_to_load",
+                    disabled=True,
+                )
+            load_col, update_col = st.columns(2)
+            with load_col:
+                if st.button("Load Selected", key="load_tender_omission_prompt"):
+                    if selected_omission:
+                        st.session_state.tender_omission_prompt_to_apply = st.session_state.tender_saved_omission_prompts[selected_omission]
+                        st.rerun()
+            new_omission_name = st.text_input(
+                "New name",
+                key="new_tender_omission_name",
+                placeholder="e.g., Tender Omission V2",
+            )
+            with update_col:
+                if st.button("Update Selected", key="update_tender_omission_prompt"):
+                    if selected_omission:
+                        success = st.session_state.supabase_client.save_prompt(
+                            name=selected_omission,
+                            prompt_text=omission_prompt,
+                            project_id=reference_project_id if reference_project_id else None,
+                            prompt_type="tender_omission",
+                        )
+                        if success:
+                            st.session_state.tender_saved_omission_prompts[selected_omission] = omission_prompt
+                            st.success("Updated tender omission prompt.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update tender omission prompt.")
+                    else:
+                        st.error("Select a prompt to update.")
+            if st.button("Save Current", key="save_tender_omission_prompt"):
+                if new_omission_name:
+                    success = st.session_state.supabase_client.save_prompt(
+                        name=new_omission_name,
+                        prompt_text=omission_prompt,
+                        project_id=reference_project_id if reference_project_id else None,
+                        prompt_type="tender_omission",
+                    )
+                    if success:
+                        st.session_state.tender_saved_omission_prompts[new_omission_name] = omission_prompt
+                        st.success("Saved tender omission prompt.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to save tender omission prompt.")
+                else:
+                    st.error("Enter a name for the omission prompt.")
     
     with prompt_tabs[2]:
         st.markdown("**Contradiction Checker** - Checks for contradictions with guidelines")
         contradiction_prompt = st.text_area(
             "Contradiction Checker Prompt Template",
-            value=st.session_state.tender_contradiction_prompt,
+            value=st.session_state.get("contradiction_prompt_editor", st.session_state.tender_contradiction_prompt),
             height=300,
             help="Use {{requirement_text}}, {{requirement_id}}, {{reference_chunks}} as placeholders",
             key="contradiction_prompt_editor"
@@ -905,12 +1075,84 @@ def show_tender_check_tab():
         if st.button("🔄 Reset to Default", key="reset_contradiction_tender"):
             st.session_state.tender_contradiction_prompt = CONTRADICTION_CHECKER_PROMPT
             st.rerun()
+        
+        # Manage saved Contradiction prompts (tender-specific, compact UI)
+        with st.expander("💾 Manage Contradiction Prompts", expanded=False):
+            if "tender_saved_contradiction_prompts" not in st.session_state:
+                st.session_state.tender_saved_contradiction_prompts = {"Default Tender Contradiction": CONTRADICTION_CHECKER_PROMPT}
+                try:
+                    db_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="tender_contradiction")
+                    for p in db_prompts:
+                        st.session_state.tender_saved_contradiction_prompts[p["name"]] = p["prompt_text"]
+                except Exception:
+                    pass
+            contradiction_names = list(st.session_state.tender_saved_contradiction_prompts.keys())
+            if contradiction_names:
+                selected_contradiction = st.selectbox(
+                    "📂 Load Saved",
+                    options=contradiction_names,
+                    index=0,
+                    key="tender_contradiction_prompt_to_load",
+                )
+            else:
+                selected_contradiction = None
+                st.selectbox(
+                    "📂 Load Saved",
+                    options=["No prompts available"],
+                    index=0,
+                    key="tender_contradiction_prompt_to_load",
+                    disabled=True,
+                )
+            load_col, update_col = st.columns(2)
+            with load_col:
+                if st.button("Load Selected", key="load_tender_contradiction_prompt"):
+                    if selected_contradiction:
+                        st.session_state.tender_contradiction_prompt_to_apply = st.session_state.tender_saved_contradiction_prompts[selected_contradiction]
+                        st.rerun()
+            new_contradiction_name = st.text_input(
+                "New name",
+                key="new_tender_contradiction_name",
+                placeholder="e.g., Tender Contradiction V2",
+            )
+            with update_col:
+                if st.button("Update Selected", key="update_tender_contradiction_prompt"):
+                    if selected_contradiction:
+                        success = st.session_state.supabase_client.save_prompt(
+                            name=selected_contradiction,
+                            prompt_text=contradiction_prompt,
+                            project_id=guidelines_project_id if guidelines_project_id else None,
+                            prompt_type="tender_contradiction",
+                        )
+                        if success:
+                            st.session_state.tender_saved_contradiction_prompts[selected_contradiction] = contradiction_prompt
+                            st.success("Updated tender contradiction prompt.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update tender contradiction prompt.")
+                    else:
+                        st.error("Select a prompt to update.")
+            if st.button("Save Current", key="save_tender_contradiction_prompt"):
+                if new_contradiction_name:
+                    success = st.session_state.supabase_client.save_prompt(
+                        name=new_contradiction_name,
+                        prompt_text=contradiction_prompt,
+                        project_id=guidelines_project_id if guidelines_project_id else None,
+                        prompt_type="tender_contradiction",
+                    )
+                    if success:
+                        st.session_state.tender_saved_contradiction_prompts[new_contradiction_name] = contradiction_prompt
+                        st.success("Saved tender contradiction prompt.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to save tender contradiction prompt.")
+                else:
+                    st.error("Enter a name for the contradiction prompt.")
     
     with prompt_tabs[3]:
         st.markdown("**Orchestrator** - Synthesizes final compliance report")
         orchestrator_prompt = st.text_area(
             "Orchestrator Prompt Template",
-            value=st.session_state.tender_orchestrator_prompt,
+            value=st.session_state.get("orchestrator_prompt_editor", st.session_state.tender_orchestrator_prompt),
             height=300,
             help="Use {{tender_summary}}, {{omission_results}}, {{contradiction_results}} as placeholders",
             key="orchestrator_prompt_editor"
@@ -919,6 +1161,78 @@ def show_tender_check_tab():
         if st.button("🔄 Reset to Default", key="reset_orchestrator_tender"):
             st.session_state.tender_orchestrator_prompt = ORCHESTRATOR_PROMPT
             st.rerun()
+        
+        # Manage saved Orchestrator prompts (tender-specific, compact UI)
+        with st.expander("💾 Manage Orchestrator Prompts", expanded=False):
+            if "tender_saved_orchestrator_prompts" not in st.session_state:
+                st.session_state.tender_saved_orchestrator_prompts = {"Default Tender Orchestrator": ORCHESTRATOR_PROMPT}
+                try:
+                    db_prompts = st.session_state.supabase_client.get_all_prompts(prompt_type="tender_orchestrator")
+                    for p in db_prompts:
+                        st.session_state.tender_saved_orchestrator_prompts[p["name"]] = p["prompt_text"]
+                except Exception:
+                    pass
+            orchestrator_names = list(st.session_state.tender_saved_orchestrator_prompts.keys())
+            if orchestrator_names:
+                selected_orchestrator = st.selectbox(
+                    "📂 Load Saved",
+                    options=orchestrator_names,
+                    index=0,
+                    key="tender_orchestrator_prompt_to_load",
+                )
+            else:
+                selected_orchestrator = None
+                st.selectbox(
+                    "📂 Load Saved",
+                    options=["No prompts available"],
+                    index=0,
+                    key="tender_orchestrator_prompt_to_load",
+                    disabled=True,
+                )
+            load_col, update_col = st.columns(2)
+            with load_col:
+                if st.button("Load Selected", key="load_tender_orchestrator_prompt"):
+                    if selected_orchestrator:
+                        st.session_state.tender_orchestrator_prompt_to_apply = st.session_state.tender_saved_orchestrator_prompts[selected_orchestrator]
+                        st.rerun()
+            new_orchestrator_name = st.text_input(
+                "New name",
+                key="new_tender_orchestrator_name",
+                placeholder="e.g., Tender Orchestrator V2",
+            )
+            with update_col:
+                if st.button("Update Selected", key="update_tender_orchestrator_prompt"):
+                    if selected_orchestrator:
+                        success = st.session_state.supabase_client.save_prompt(
+                            name=selected_orchestrator,
+                            prompt_text=orchestrator_prompt,
+                            project_id=reference_project_id if reference_project_id else None,
+                            prompt_type="tender_orchestrator",
+                        )
+                        if success:
+                            st.session_state.tender_saved_orchestrator_prompts[selected_orchestrator] = orchestrator_prompt
+                            st.success("Updated tender orchestrator prompt.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update tender orchestrator prompt.")
+                    else:
+                        st.error("Select a prompt to update.")
+            if st.button("Save Current", key="save_tender_orchestrator_prompt"):
+                if new_orchestrator_name:
+                    success = st.session_state.supabase_client.save_prompt(
+                        name=new_orchestrator_name,
+                        prompt_text=orchestrator_prompt,
+                        project_id=reference_project_id if reference_project_id else None,
+                        prompt_type="tender_orchestrator",
+                    )
+                    if success:
+                        st.session_state.tender_saved_orchestrator_prompts[new_orchestrator_name] = orchestrator_prompt
+                        st.success("Saved tender orchestrator prompt.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to save tender orchestrator prompt.")
+                else:
+                    st.error("Enter a name for the orchestrator prompt.")
     
     st.markdown("---")
     
@@ -1023,13 +1337,27 @@ def show_tender_check_tab():
         
         # Requirements Breakdown
         requirements = result.get("requirements", [])
+        requirements_by_id = {}
         if requirements:
+            # Build lookup for later sections (e.g. Critical Issues)
+            for i, req in enumerate(requirements, 1):
+                req_id = req.get("id", f"REQ-{i}")
+                requirements_by_id[req_id] = req
+
             st.markdown("### 📋 Extracted Requirements")
             st.write(f"**Total Requirements:** {len(requirements)}")
             with st.expander("View All Requirements", expanded=False):
                 for i, req in enumerate(requirements, 1):
-                    st.markdown(f"**{req.get('id', f'REQ-{i}')}** ({req.get('category', 'N/A')})")
-                    st.caption(req.get('requirement_text', '')[:200] + "...")
+                    req_id = req.get("id", f"REQ-{i}")
+                    st.markdown(f"**{req_id}** ({req.get('category', 'N/A')})")
+                    full_text = req.get("requirement_text", "") or ""
+                    # Show a short preview, plus an explicit control to see the full requirement
+                    if len(full_text) > 200:
+                        st.caption(full_text[:200] + "...")
+                        with st.expander("View full requirement", expanded=False):
+                            st.write(full_text)
+                    else:
+                        st.write(full_text)
         
         # Omission Summary
         omission_summary = final_report.get("omission_summary", {})
@@ -1073,6 +1401,17 @@ def show_tender_check_tab():
         
         # Critical Issues
         critical_issues = final_report.get("critical_issues", [])
+        omission_results = result.get("omission_results", [])
+        contradiction_results = result.get("contradiction_results", [])
+
+        # Build quick lookups for more granular details
+        omission_by_id = {
+            r.get("requirement_id"): r for r in omission_results if r.get("requirement_id")
+        }
+        contradiction_by_id = {
+            r.get("requirement_id"): r for r in contradiction_results if r.get("requirement_id")
+        }
+
         if critical_issues:
             st.markdown("### 🚨 Critical Issues")
             for issue in critical_issues:
@@ -1081,10 +1420,63 @@ def show_tender_check_tab():
                     "MODERATE": "🟡",
                     "MINOR": "🟢"
                 }.get(issue.get("severity", ""), "⚪")
-                
-                st.markdown(f"{severity_color} **{issue.get('requirement_id', 'N/A')}** - {issue.get('issue_type', 'N/A')}")
+
+                issue_type = issue.get("issue_type", "N/A")
+                req_id = issue.get("requirement_id", "N/A")
+
+                st.markdown(f"{severity_color} **{req_id}** - {issue_type}")
                 st.caption(issue.get("description", ""))
                 st.caption(f"**Impact:** {issue.get('impact', 'N/A')}")
+
+                # Show the full underlying requirement text (if available)
+                requirement = requirements_by_id.get(req_id) if requirements else None
+                if requirement:
+                    with st.expander("View full requirement", expanded=False):
+                        st.write(requirement.get("requirement_text", ""))
+
+                # Surface more granular details from omission / contradiction agents
+                if issue_type == "OMISSION":
+                    omission = omission_by_id.get(req_id)
+                    if omission:
+                        st.markdown("**Omission details**")
+                        st.write(
+                            f"Status: {omission.get('status', 'UNKNOWN')} "
+                            f"(confidence: {omission.get('confidence', 0.0):.2f})"
+                        )
+                        missing = omission.get("missing_elements") or []
+                        if missing:
+                            st.write("Missing elements:")
+                            for item in missing:
+                                st.write(f"- {item}")
+                        citations = omission.get("citations") or []
+                        if citations:
+                            with st.expander("Supporting citations from reference documents", expanded=False):
+                                for cit in citations:
+                                    doc_ref = cit.get("document_reference", "Unknown document")
+                                    src = cit.get("source_text", "")
+                                    st.markdown(f"- *{doc_ref}*: {src}")
+
+                elif issue_type == "CONTRADICTION":
+                    contradiction = contradiction_by_id.get(req_id)
+                    if contradiction:
+                        st.markdown("**Contradiction details**")
+                        st.write(f"Severity: {contradiction.get('severity', 'NO_CONTRADICTION')}")
+                        details = contradiction.get("contradiction_details", "")
+                        if details:
+                            st.write(details)
+                        ref_guideline = contradiction.get("reference_guideline")
+                        if ref_guideline:
+                            st.write(f"Reference guideline: {ref_guideline}")
+                        tender_stmt = contradiction.get("tender_statement")
+                        if tender_stmt:
+                            st.write(f"Tender statement: {tender_stmt}")
+                        citations = contradiction.get("citations") or []
+                        if citations:
+                            with st.expander("Supporting citations from guidelines", expanded=False):
+                                for cit in citations:
+                                    doc_ref = cit.get("document_reference", "Unknown document")
+                                    src = cit.get("source_text", "")
+                                    st.markdown(f"- *{doc_ref}*: {src}")
         
         # Recommendations
         recommendations = final_report.get("recommendations", [])

@@ -1,10 +1,22 @@
 """Omission checker agent - checks if requirements are fulfilled using RAG."""
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from clients.ai_client import AIClient
 from clients.supabase_client import SupabaseClient
 from tender_checker.prompts.agent_prompts import OMISSION_CHECKER_PROMPT
+
+
+def _format_chunks(chunks: List[Dict[str, Any]]) -> str:
+    """Format chunk dicts for prompt (shared formatting)."""
+    chunk_texts = []
+    for i, chunk in enumerate(chunks, 1):
+        file_name = chunk.get("file_name") or chunk.get("original_filename", "Unknown")
+        page_num = chunk.get("page_number")
+        page_info = f" (page {page_num})" if page_num else ""
+        chunk_texts.append(f"Chunk {i} from {file_name}{page_info}:\n{chunk.get('content', '')}")
+    return "\n\n".join(chunk_texts) if chunk_texts else "No relevant documents found."
 
 class OmissionCheckerAgent:
     """Agent that checks for omissions using RAG search."""
@@ -50,21 +62,36 @@ class OmissionCheckerAgent:
                 top_k=top_k
             )
         
-        # Format chunks for prompt
-        chunk_texts = []
-        for i, chunk in enumerate(chunks, 1):
-            file_name = chunk.get('file_name') or chunk.get('original_filename', 'Unknown')
-            page_num = chunk.get('page_number')
-            page_info = f" (page {page_num})" if page_num else ""
-            chunk_texts.append(f"Chunk {i} from {file_name}{page_info}:\n{chunk.get('content', '')}")
-        
-        reference_chunks = "\n\n".join(chunk_texts) if chunk_texts else "No relevant documents found."
-        
-        # Format prompt
+        reference_chunks = _format_chunks(chunks)
+        return self._call_omission_llm(req_id, req_text, reference_chunks, openai_semaphore=None)
+
+    def check_requirement_with_chunks(
+        self,
+        requirement: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+        openai_semaphore: Optional[threading.Semaphore] = None,
+    ) -> Dict[str, Any]:
+        """
+        Check one requirement using pre-retrieved chunks (no RAG call). Use openai_semaphore to limit concurrent OpenAI calls.
+        """
+        req_text = requirement.get("requirement_text", "")
+        req_id = requirement.get("id", "UNKNOWN")
+        reference_chunks = _format_chunks(chunks)
+        return self._call_omission_llm(req_id, req_text, reference_chunks, openai_semaphore)
+
+    def _call_omission_llm(
+        self,
+        req_id: str,
+        req_text: str,
+        reference_chunks: str,
+        openai_semaphore: Optional[threading.Semaphore] = None,
+    ) -> Dict[str, Any]:
+        """Call OpenAI for omission judgment; optionally under semaphore for rate limiting."""
         prompt = self.prompt_template.replace("{{requirement_text}}", req_text)
         prompt = prompt.replace("{{requirement_id}}", req_id)
         prompt = prompt.replace("{{reference_chunks}}", reference_chunks)
-        
+        if openai_semaphore:
+            openai_semaphore.acquire()
         try:
             response = self.ai_client.client.chat.completions.create(
                 model=self.ai_client.model,
@@ -81,7 +108,6 @@ class OmissionCheckerAgent:
                 response_format={"type": "json_object"},
                 temperature=0.1
             )
-            
             result = json.loads(response.choices[0].message.content)
             return result
         except Exception as e:
@@ -93,6 +119,9 @@ class OmissionCheckerAgent:
                 "citations": [],
                 "missing_elements": []
             }
+        finally:
+            if openai_semaphore:
+                openai_semaphore.release()
     
     def check_all_requirements(
         self,

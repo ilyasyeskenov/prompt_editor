@@ -107,12 +107,12 @@ ORCHESTRATOR_PROMPT = """You are a Senior Compliance Review Officer. Your task i
 {{contradiction_results}}
 
 **Instructions:**
-1. Review all omission check results
-2. Review all contradiction check results
-3. Assess overall compliance status
-4. Identify critical issues that must be addressed
-5. Provide actionable recommendations
-6. Generate a risk assessment
+1. Review all omission check results in detail, paying attention to `missing_elements`, `status`, and `citations` for each requirement.
+2. Review all contradiction check results in detail, paying attention to `severity`, `contradiction_details`, `reference_guideline`, `tender_statement`, and `citations`.
+3. Assess overall compliance status.
+4. Identify critical issues that must be addressed. For each critical issue, clearly describe what is non-compliant, referencing the original requirement and the specific missing or contradicting clauses from the source documents.
+5. Provide actionable, concrete recommendations that explain exactly what should be changed in the tender to become compliant.
+6. Generate a risk assessment that explains the practical impact of non-compliance (e.g., operational, regulatory, financial).
 
 Return your analysis as JSON:
 
@@ -126,8 +126,8 @@ Return your analysis as JSON:
       "issue_type": "OMISSION" | "CONTRADICTION",
       "requirement_id": "REQ-X",
       "severity": "CRITICAL" | "MODERATE" | "MINOR",
-      "description": "Description of the issue",
-      "impact": "Impact on tender submission"
+      "description": "Concrete explanation of the non-compliance, including which parts of the requirement are not met or are contradicted, and pointing to specific clauses if possible.",
+      "impact": "Clear explanation of the impact on the tender submission (e.g., regulatory breach, safety risk, performance degradation, commercial risk)."
     }
   ],
   "omission_summary": {
