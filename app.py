@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import traceback
 from typing import List, Dict, Any
+from datetime import datetime
 
 # Import utilities
 from utils.session_state import initialize_session_state
@@ -17,7 +18,7 @@ from utils.ai_processing import (
 from utils.ui_components import display_chunks_metadata, display_result, enrich_citation_with_doc_info
 from utils.pdf_processor import extract_text_from_pdf
 from utils.logging import log
-from config.config import OPENAI_MODEL
+from config.config import OPENAI_MODEL, PROJECT_IDS
 from tender_checker.workflow import TenderCheckWorkflow
 from tender_checker.prompts.agent_prompts import (
     BREAKDOWN_AGENT_PROMPT,
@@ -833,30 +834,24 @@ def show_tender_check_tab():
     
     col1, col2 = st.columns(2)
     with col1:
-        PROJECT_OPTIONS = {
-            "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
-            "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
-            "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63"
-        }
-        
         reference_project = st.selectbox(
             "Reference Documents Project",
-            options=list(PROJECT_OPTIONS.keys()),
+            options=list(PROJECT_IDS.keys()),
             index=2,  # Default to 'Tender Requirement-2'
             help="Project ID for reference documents (used for omission checking)",
             key="tender_reference_project"
         )
-        reference_project_id = PROJECT_OPTIONS[reference_project]
+        reference_project_id = PROJECT_IDS[reference_project]
     
     with col2:
         guidelines_project = st.selectbox(
             "Guidelines Project",
-            options=list(PROJECT_OPTIONS.keys()),
+            options=list(PROJECT_IDS.keys()),
             index=2,  # Default to 'Tender Requirement-2'
             help="Project ID for guidelines (used for contradiction checking). If same as reference, leave as is.",
             key="tender_guidelines_project"
         )
-        guidelines_project_id = PROJECT_OPTIONS[guidelines_project]
+        guidelines_project_id = PROJECT_IDS[guidelines_project]
     
     # Advanced settings
     with st.expander("⚙️ Advanced Settings", expanded=False):
@@ -1265,6 +1260,53 @@ def show_tender_check_tab():
                 return
             st.success(f"✓ Extracted {len(tender_text)} characters from PDF")
         
+        # Initialize progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        progress_details = st.empty()
+        per_req_status = st.empty()
+        
+        # Track per-requirement status
+        if "tender_progress_status" not in st.session_state:
+            st.session_state.tender_progress_status = {}
+        
+        def progress_callback(step_name: str, step_num: int, total_steps: int, details: Dict[str, Any]):
+            """Callback for workflow progress updates."""
+            progress_pct = int((step_num / total_steps) * 100)
+            progress_bar.progress(progress_pct)
+            
+            step_labels = {
+                "breakdown": "Breaking down tender",
+                "retrieval": "Retrieving reference documents",
+                "check": "Checking requirements",
+                "orchestrate": "Synthesizing results"
+            }
+            
+            step_label = step_labels.get(step_name, step_name)
+            status_msg = f"🔄 Step {step_num}/{total_steps}: {step_label}"
+            
+            if details.get("completed") is not None and details.get("total_requirements"):
+                status_msg += f" ({details['completed']}/{details['total_requirements']})"
+            
+            status_text.text(status_msg)
+            
+            # Show detailed progress
+            detail_parts = []
+            if details.get("step"):
+                detail_parts.append(details["step"])
+            if details.get("current_requirement"):
+                detail_parts.append(f"Current: {details['current_requirement']}")
+            if detail_parts:
+                progress_details.text(" | ".join(detail_parts))
+            
+            # Update per-requirement status
+            if step_name == "check" and details.get("current_requirement"):
+                req_id = details["current_requirement"]
+                st.session_state.tender_progress_status[req_id] = {
+                    "step": "checking",
+                    "status": "in_progress"
+                }
+        
         # Initialize workflow
         try:
             workflow = TenderCheckWorkflow(
@@ -1273,20 +1315,14 @@ def show_tender_check_tab():
                 breakdown_prompt=st.session_state.tender_breakdown_prompt,
                 omission_prompt=st.session_state.tender_omission_prompt,
                 contradiction_prompt=st.session_state.tender_contradiction_prompt,
-                orchestrator_prompt=st.session_state.tender_orchestrator_prompt
+                orchestrator_prompt=st.session_state.tender_orchestrator_prompt,
+                progress_callback=progress_callback
             )
         except Exception as e:
             st.error(f"Failed to initialize workflow: {str(e)}")
             return
         
-        # Run workflow with progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
         try:
-            status_text.text("🔄 Step 1/4: Breaking down tender into requirements...")
-            progress_bar.progress(25)
-            
             # Run workflow
             result = workflow.run(
                 tender_text=tender_text,
@@ -1296,15 +1332,19 @@ def show_tender_check_tab():
             )
             
             progress_bar.progress(100)
-            status_text.empty()
-            progress_bar.empty()
+            status_text.text("✅ Complete!")
+            progress_details.empty()
+            per_req_status.empty()
             
             # Store result in session state
             st.session_state.tender_check_result = result
+            st.session_state.tender_progress_status = {}  # Clear progress status
             
         except Exception as e:
             progress_bar.empty()
             status_text.empty()
+            progress_details.empty()
+            per_req_status.empty()
             st.error(f"Error during tender checking: {str(e)}")
             import traceback
             with st.expander("Error Details"):
@@ -1346,18 +1386,50 @@ def show_tender_check_tab():
 
             st.markdown("### 📋 Extracted Requirements")
             st.write(f"**Total Requirements:** {len(requirements)}")
-            with st.expander("View All Requirements", expanded=False):
-                for i, req in enumerate(requirements, 1):
-                    req_id = req.get("id", f"REQ-{i}")
-                    st.markdown(f"**{req_id}** ({req.get('category', 'N/A')})")
-                    full_text = req.get("requirement_text", "") or ""
-                    # Show a short preview, plus an explicit control to see the full requirement
-                    if len(full_text) > 200:
-                        st.caption(full_text[:200] + "...")
-                        with st.expander("View full requirement", expanded=False):
-                            st.write(full_text)
-                    else:
-                        st.write(full_text)
+            
+            # Filter and sort options
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                filter_category = st.selectbox(
+                    "Filter by Category",
+                    options=["All"] + list(set(req.get("category", "N/A") for req in requirements)),
+                    key="req_filter_category"
+                )
+            with col2:
+                sort_by = st.selectbox(
+                    "Sort by",
+                    options=["ID", "Category"],
+                    key="req_sort_by"
+                )
+            with col3:
+                show_all = st.checkbox("Show all requirements", value=False, key="req_show_all")
+            
+            # Filter and sort requirements
+            filtered_requirements = requirements
+            if filter_category != "All":
+                filtered_requirements = [r for r in filtered_requirements if r.get("category", "N/A") == filter_category]
+            
+            if sort_by == "Category":
+                filtered_requirements = sorted(filtered_requirements, key=lambda x: x.get("category", "N/A"))
+            
+            # Display requirements - one expander per requirement
+            display_count = len(filtered_requirements) if show_all else min(10, len(filtered_requirements))
+            
+            for i, req in enumerate(filtered_requirements[:display_count], 1):
+                req_id = req.get("id", f"REQ-{i}")
+                category = req.get("category", "N/A")
+                full_text = req.get("requirement_text", "") or ""
+                preview = full_text[:150] + "..." if len(full_text) > 150 else full_text
+                
+                with st.expander(f"**{req_id}** ({category})", expanded=False):
+                    st.markdown(f"**Category:** {category}")
+                    st.markdown("**Requirement Text:**")
+                    st.write(full_text)
+                    if req.get("context"):
+                        st.markdown(f"**Context:** {req.get('context')}")
+            
+            if len(filtered_requirements) > display_count and not show_all:
+                st.info(f"Showing {display_count} of {len(filtered_requirements)} requirements. Check 'Show all requirements' to see all.")
         
         # Omission Summary
         omission_summary = final_report.get("omission_summary", {})
@@ -1414,7 +1486,40 @@ def show_tender_check_tab():
 
         if critical_issues:
             st.markdown("### 🚨 Critical Issues")
-            for issue in critical_issues:
+            
+            # Filter options for critical issues
+            col1, col2 = st.columns(2)
+            with col1:
+                filter_severity = st.selectbox(
+                    "Filter by Severity",
+                    options=["All", "CRITICAL", "MODERATE", "MINOR"],
+                    key="critical_filter_severity"
+                )
+            with col2:
+                filter_issue_type = st.selectbox(
+                    "Filter by Type",
+                    options=["All", "OMISSION", "CONTRADICTION"],
+                    key="critical_filter_type"
+                )
+            
+            # Filter issues
+            filtered_issues = critical_issues
+            if filter_severity != "All":
+                filtered_issues = [i for i in filtered_issues if i.get("severity") == filter_severity]
+            if filter_issue_type != "All":
+                filtered_issues = [i for i in filtered_issues if i.get("issue_type") == filter_issue_type]
+            
+            # Sort by severity (CRITICAL > MODERATE > MINOR)
+            severity_order = {"CRITICAL": 0, "MODERATE": 1, "MINOR": 2}
+            filtered_issues = sorted(
+                filtered_issues,
+                key=lambda x: (severity_order.get(x.get("severity", ""), 99), x.get("requirement_id", ""))
+            )
+            
+            if not filtered_issues:
+                st.info("No issues match the selected filters.")
+            else:
+                for issue in filtered_issues:
                 severity_color = {
                     "CRITICAL": "🔴",
                     "MODERATE": "🟡",
@@ -1503,14 +1608,193 @@ def show_tender_check_tab():
         
         # Download Results
         st.markdown("---")
-        result_json = json.dumps(result, indent=2)
-        st.download_button(
-            label="📥 Download Full Results (JSON)",
-            data=result_json,
-            file_name="tender_check_results.json",
-            mime="application/json",
-            key="download_tender_results"
-        )
+        st.subheader("📥 Export Results")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            result_json = json.dumps(result, indent=2)
+            st.download_button(
+                label="📥 Download JSON",
+                data=result_json,
+                file_name="tender_check_results.json",
+                mime="application/json",
+                key="download_tender_results_json",
+                use_container_width=True
+            )
+        
+        with col2:
+            # Generate HTML report
+            html_report = generate_html_report(final_report, requirements, critical_issues, omission_results, contradiction_results)
+            st.download_button(
+                label="📄 Download HTML Report",
+                data=html_report,
+                file_name="tender_check_report.html",
+                mime="text/html",
+                key="download_tender_results_html",
+                use_container_width=True
+            )
+        
+        with col3:
+            # Generate text summary
+            text_summary = generate_text_summary(final_report, critical_issues)
+            st.download_button(
+                label="📝 Download Text Summary",
+                data=text_summary,
+                file_name="tender_check_summary.txt",
+                mime="text/plain",
+                key="download_tender_results_text",
+                use_container_width=True
+            )
+
+
+def generate_html_report(
+    final_report: Dict[str, Any],
+    requirements: List[Dict[str, Any]],
+    critical_issues: List[Dict[str, Any]],
+    omission_results: List[Dict[str, Any]],
+    contradiction_results: List[Dict[str, Any]]
+) -> str:
+    """Generate HTML report for tender check results."""
+    from datetime import datetime
+    overall_status = final_report.get("overall_status", "UNKNOWN")
+    compliance_score = final_report.get("compliance_score", 0.0)
+    summary = final_report.get("summary", "No summary available")
+    
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Tender Check Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+        h2 {{ color: #34495e; margin-top: 30px; }}
+        .status-compliant {{ color: #27ae60; font-weight: bold; }}
+        .status-non-compliant {{ color: #e74c3c; font-weight: bold; }}
+        .status-conditional {{ color: #f39c12; font-weight: bold; }}
+        .issue-critical {{ background-color: #fee; padding: 10px; margin: 10px 0; border-left: 4px solid #e74c3c; }}
+        .issue-moderate {{ background-color: #fff8e1; padding: 10px; margin: 10px 0; border-left: 4px solid #f39c12; }}
+        .issue-minor {{ background-color: #f1f8e9; padding: 10px; margin: 10px 0; border-left: 4px solid #8bc34a; }}
+        table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+        th {{ background-color: #3498db; color: white; }}
+        .summary-box {{ background-color: #ecf0f1; padding: 20px; border-radius: 5px; margin: 20px 0; }}
+    </style>
+</head>
+<body>
+    <h1>Tender Compliance Check Report</h1>
+    <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+    
+    <div class="summary-box">
+        <h2>Executive Summary</h2>
+        <p><strong>Overall Status:</strong> <span class="status-{overall_status.lower().replace('_', '-')}">{overall_status}</span></p>
+        <p><strong>Compliance Score:</strong> {compliance_score:.2%}</p>
+        <p>{summary}</p>
+    </div>
+    
+    <h2>Critical Issues</h2>
+    <p><strong>Total Issues:</strong> {len(critical_issues)}</p>
+"""
+    
+    for issue in critical_issues:
+        severity = issue.get("severity", "UNKNOWN")
+        issue_class = f"issue-{severity.lower()}"
+        html += f"""
+    <div class="{issue_class}">
+        <h3>{issue.get('requirement_id', 'N/A')} - {issue.get('issue_type', 'N/A')}</h3>
+        <p><strong>Severity:</strong> {severity}</p>
+        <p><strong>Description:</strong> {issue.get('description', 'N/A')}</p>
+        <p><strong>Impact:</strong> {issue.get('impact', 'N/A')}</p>
+    </div>
+"""
+    
+    html += f"""
+    <h2>Requirements Summary</h2>
+    <p><strong>Total Requirements:</strong> {len(requirements)}</p>
+    
+    <h2>Omission Check Summary</h2>
+    <table>
+        <tr>
+            <th>Requirement ID</th>
+            <th>Status</th>
+            <th>Confidence</th>
+        </tr>
+"""
+    
+    for om_result in omission_results[:20]:  # Limit to first 20 for readability
+        html += f"""
+        <tr>
+            <td>{om_result.get('requirement_id', 'N/A')}</td>
+            <td>{om_result.get('status', 'N/A')}</td>
+            <td>{om_result.get('confidence', 0.0):.2%}</td>
+        </tr>
+"""
+    
+    html += """
+    </table>
+    
+    <h2>Contradiction Check Summary</h2>
+    <table>
+        <tr>
+            <th>Requirement ID</th>
+            <th>Has Contradiction</th>
+            <th>Severity</th>
+        </tr>
+"""
+    
+    for con_result in contradiction_results[:20]:  # Limit to first 20
+        html += f"""
+        <tr>
+            <td>{con_result.get('requirement_id', 'N/A')}</td>
+            <td>{'Yes' if con_result.get('has_contradiction') else 'No'}</td>
+            <td>{con_result.get('severity', 'N/A')}</td>
+        </tr>
+"""
+    
+    html += """
+    </table>
+</body>
+</html>
+"""
+    return html
+
+
+def generate_text_summary(final_report: Dict[str, Any], critical_issues: List[Dict[str, Any]]) -> str:
+    """Generate plain text summary report."""
+    from datetime import datetime
+    overall_status = final_report.get("overall_status", "UNKNOWN")
+    compliance_score = final_report.get("compliance_score", 0.0)
+    summary = final_report.get("summary", "No summary available")
+    
+    text = f"""
+TENDER COMPLIANCE CHECK REPORT
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+EXECUTIVE SUMMARY
+=================
+Overall Status: {overall_status}
+Compliance Score: {compliance_score:.2%}
+
+{summary}
+
+CRITICAL ISSUES
+===============
+Total Issues: {len(critical_issues)}
+
+"""
+    
+    for i, issue in enumerate(critical_issues, 1):
+        text += f"""
+Issue {i}: {issue.get('requirement_id', 'N/A')} - {issue.get('issue_type', 'N/A')}
+Severity: {issue.get('severity', 'N/A')}
+Description: {issue.get('description', 'N/A')}
+Impact: {issue.get('impact', 'N/A')}
+
+"""
+    
+    return text
 
 
 def main():
@@ -1525,22 +1809,16 @@ def main():
     st.markdown("---")
     
     # Project ID selection (global setting)
-    PROJECT_OPTIONS = {
-        "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
-        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
-        "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63"
-    }
-    
     selected_project = st.sidebar.selectbox(
         "Project",
-        options=list(PROJECT_OPTIONS.keys()),
+        options=list(PROJECT_IDS.keys()),
         index=0,  # Default to "Building services"
         help="Select the project to check requirements against documents in Supabase",
         key="project_selection"
     )
     
     # Get the actual project ID from the selection
-    project_id = PROJECT_OPTIONS[selected_project]
+    project_id = PROJECT_IDS[selected_project]
     
     # Set top_k to default value of 5
     top_k = 5

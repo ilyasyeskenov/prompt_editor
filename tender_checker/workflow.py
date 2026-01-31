@@ -1,6 +1,6 @@
 """LangGraph workflow for tender checking multi-agent system."""
 import threading
-from typing import TypedDict, List, Dict, Any
+from typing import TypedDict, List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.graph import StateGraph, END
 from clients.ai_client import AIClient
@@ -14,6 +14,58 @@ from tender_checker.agents.orchestrator_agent import OrchestratorAgent
 RETRIEVAL_BATCH_SIZE = 15
 RETRIEVAL_MAX_WORKERS = 10
 OPENAI_CONCURRENCY = 5
+
+
+def normalize_requirement_ids(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize requirement IDs to ensure consistent format (REQ-1, REQ-2, etc.).
+    
+    Args:
+        requirements: List of requirement dicts
+        
+    Returns:
+        List of requirements with normalized IDs
+    """
+    normalized = []
+    for i, req in enumerate(requirements, 1):
+        normalized_req = req.copy()
+        normalized_req["id"] = f"REQ-{i}"
+        normalized.append(normalized_req)
+    return normalized
+
+
+def normalize_final_report(final_report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize final report schema to ensure all expected keys exist with defaults.
+    
+    Args:
+        final_report: Raw orchestrator output
+        
+    Returns:
+        Normalized report with all expected keys
+    """
+    return {
+        "overall_status": final_report.get("overall_status", "UNKNOWN"),
+        "compliance_score": final_report.get("compliance_score", 0.0),
+        "summary": final_report.get("summary", "No summary available"),
+        "critical_issues": final_report.get("critical_issues", []),
+        "omission_summary": final_report.get("omission_summary", {
+            "total_requirements": 0,
+            "fulfilled": 0,
+            "partially_fulfilled": 0,
+            "not_fulfilled": 0,
+            "missing_requirements": []
+        }),
+        "contradiction_summary": final_report.get("contradiction_summary", {
+            "total_checked": 0,
+            "critical_contradictions": 0,
+            "moderate_contradictions": 0,
+            "minor_contradictions": 0,
+            "contradictions": []
+        }),
+        "recommendations": final_report.get("recommendations", []),
+        "risk_assessment": final_report.get("risk_assessment", "Unable to assess risk")
+    }
 
 
 class TenderCheckState(TypedDict):
@@ -44,12 +96,14 @@ class TenderCheckWorkflow:
         retrieval_batch_size: int = RETRIEVAL_BATCH_SIZE,
         retrieval_max_workers: int = RETRIEVAL_MAX_WORKERS,
         openai_concurrency: int = OPENAI_CONCURRENCY,
+        progress_callback: Optional[Callable[[str, int, int, Dict[str, Any]], None]] = None,
     ):
         self.ai_client = ai_client
         self.supabase_client = supabase_client
         self.retrieval_batch_size = retrieval_batch_size
         self.retrieval_max_workers = retrieval_max_workers
         self.openai_semaphore = threading.Semaphore(openai_concurrency)
+        self.progress_callback = progress_callback
 
         # Initialize agents with custom prompts
         self.breakdown_agent = BreakdownAgent(ai_client, breakdown_prompt)
@@ -80,15 +134,31 @@ class TenderCheckWorkflow:
     def _breakdown_node(self, state: TenderCheckState) -> Dict[str, Any]:
         """Break down tender into requirements."""
         try:
+            if self.progress_callback:
+                self.progress_callback("breakdown", 1, 4, {"step": "Breaking down tender into requirements..."})
+            
             result = self.breakdown_agent.breakdown_tender(state["tender_text"])
             requirements = result.get("requirements", [])
+            
+            # Normalize requirement IDs
+            requirements = normalize_requirement_ids(requirements)
+            
             tender_summary = f"Tender document with {len(requirements)} requirements extracted."
+            
+            if self.progress_callback:
+                self.progress_callback("breakdown", 1, 4, {
+                    "step": "Breakdown complete",
+                    "requirements_count": len(requirements)
+                })
+            
             return {
                 "requirements": requirements,
                 "tender_summary": tender_summary,
                 "error": ""
             }
         except Exception as e:
+            if self.progress_callback:
+                self.progress_callback("breakdown", 1, 4, {"step": "Breakdown error", "error": str(e)})
             return {
                 "requirements": [],
                 "tender_summary": "",
@@ -134,6 +204,13 @@ class TenderCheckWorkflow:
         if not requirements:
             return {"retrieval_results": []}
 
+        if self.progress_callback:
+            self.progress_callback("retrieval", 2, 4, {
+                "step": "Starting retrieval",
+                "total_requirements": len(requirements),
+                "completed": 0
+            })
+
         project_id = state["project_id"]
         guidelines_id = state.get("guidelines_project_id", project_id)
         top_k = state.get("top_k", 8)
@@ -141,6 +218,8 @@ class TenderCheckWorkflow:
         max_workers = min(self.retrieval_max_workers, len(requirements))
 
         results = [None] * len(requirements)
+        completed_count = 0
+        
         for start in range(0, len(requirements), batch_size):
             batch = requirements[start : start + batch_size]
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -158,12 +237,28 @@ class TenderCheckWorkflow:
                     idx = future_to_idx[future]
                     try:
                         results[idx] = future.result()
+                        completed_count += 1
+                        if self.progress_callback:
+                            self.progress_callback("retrieval", 2, 4, {
+                                "step": f"Retrieving chunks",
+                                "total_requirements": len(requirements),
+                                "completed": completed_count
+                            })
                     except Exception as e:
                         results[idx] = {
                             "requirement": requirements[idx],
                             "omission_chunks": [],
                             "contradiction_chunks": [],
                         }
+                        completed_count += 1
+        
+        if self.progress_callback:
+            self.progress_callback("retrieval", 2, 4, {
+                "step": "Retrieval complete",
+                "total_requirements": len(requirements),
+                "completed": completed_count
+            })
+        
         return {"retrieval_results": results}
 
     def _check_node(self, state: TenderCheckState) -> Dict[str, Any]:
@@ -172,10 +267,19 @@ class TenderCheckWorkflow:
         if not retrieval_results:
             return {"omission_results": [], "contradiction_results": []}
 
+        if self.progress_callback:
+            self.progress_callback("check", 3, 4, {
+                "step": "Starting requirement checks",
+                "total_requirements": len(retrieval_results),
+                "completed": 0
+            })
+
         omission_results = [None] * len(retrieval_results)
         contradiction_results = [None] * len(retrieval_results)
+        completed_count = 0
 
         def process_one(idx: int, item: Dict[str, Any]) -> None:
+            nonlocal completed_count
             req = item["requirement"]
             om_chunks = item.get("omission_chunks", [])
             con_chunks = item.get("contradiction_chunks", [])
@@ -212,14 +316,30 @@ class TenderCheckWorkflow:
                     "citations": [],
                     "recommendation": "",
                 }
+            
+            completed_count += 1
+            if self.progress_callback:
+                self.progress_callback("check", 3, 4, {
+                    "step": f"Checking requirements",
+                    "total_requirements": len(retrieval_results),
+                    "completed": completed_count,
+                    "current_requirement": req_id
+                })
 
-        with ThreadPoolExecutor(max_workers=len(retrieval_results)) as executor:
+        with ThreadPoolExecutor(max_workers=min(20, len(retrieval_results))) as executor:
             futures = [
                 executor.submit(process_one, i, item)
                 for i, item in enumerate(retrieval_results)
             ]
             for f in futures:
                 f.result()
+
+        if self.progress_callback:
+            self.progress_callback("check", 3, 4, {
+                "step": "Check complete",
+                "total_requirements": len(retrieval_results),
+                "completed": completed_count
+            })
 
         return {
             "omission_results": omission_results,
@@ -229,6 +349,11 @@ class TenderCheckWorkflow:
     def _orchestrate_node(self, state: TenderCheckState) -> Dict[str, Any]:
         """Synthesize all results (single call after check node)."""
         try:
+            if self.progress_callback:
+                self.progress_callback("orchestrate", 4, 4, {
+                    "step": "Synthesizing final report..."
+                })
+            
             omission_results = state.get("omission_results", [])
             contradiction_results = state.get("contradiction_results", [])
             errors = []
@@ -240,14 +365,30 @@ class TenderCheckWorkflow:
                 omission_results=omission_results or [],
                 contradiction_results=contradiction_results or [],
             )
+            
+            # Normalize final report schema
+            final_report = normalize_final_report(final_report)
+            
             error_msg = "; ".join(errors) if errors else ""
+            
+            if self.progress_callback:
+                self.progress_callback("orchestrate", 4, 4, {
+                    "step": "Orchestration complete",
+                    "overall_status": final_report.get("overall_status", "UNKNOWN")
+                })
+            
             return {"final_report": final_report, "error": error_msg}
         except Exception as e:
+            if self.progress_callback:
+                self.progress_callback("orchestrate", 4, 4, {
+                    "step": "Orchestration error",
+                    "error": str(e)
+                })
             return {
-                "final_report": {
+                "final_report": normalize_final_report({
                     "overall_status": "ERROR",
                     "summary": f"Error: {str(e)}"
-                },
+                }),
                 "error": f"Orchestration error: {str(e)}"
             }
     

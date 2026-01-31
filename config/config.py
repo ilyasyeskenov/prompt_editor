@@ -26,3 +26,10 @@ DATA_DIR = "data"
 DOCUMENTS_DIR = os.path.join(DATA_DIR, "documents")
 PROJECTS_DIR = os.path.join(DATA_DIR, "projects")
 
+# Project IDs: display name -> UUID (used in sidebar and Tender Checker tab)
+PROJECT_IDS = {
+    "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
+    "Tender Requirement (Annex1)": "00d06bf0-7572-4f23-aaec-46a9adad5e63",
+    "Tender_handbook": "05ac317c-e700-4d5b-a99e-a1a92fc619e5"
+}
+
