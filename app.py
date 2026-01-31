@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import json
 import traceback
+import threading
 from typing import List, Dict, Any
 from datetime import datetime
 
@@ -1281,25 +1282,27 @@ def show_tender_check_tab():
             st.session_state.tender_progress_status = {}
         
         def progress_callback(step_name: str, step_num: int, total_steps: int, details: Dict[str, Any]):
-            """Callback for workflow progress updates."""
+            """Callback for workflow progress updates. Only updates Streamlit UI from the main thread."""
+            if threading.current_thread() is not threading.main_thread():
+                return
             progress_pct = int((step_num / total_steps) * 100)
             progress_bar.progress(progress_pct)
-            
+
             step_labels = {
                 "breakdown": "Breaking down tender",
                 "retrieval": "Retrieving reference documents",
                 "check": "Checking requirements",
                 "orchestrate": "Synthesizing results"
             }
-            
+
             step_label = step_labels.get(step_name, step_name)
             status_msg = f"🔄 Step {step_num}/{total_steps}: {step_label}"
-            
+
             if details.get("completed") is not None and details.get("total_requirements"):
                 status_msg += f" ({details['completed']}/{details['total_requirements']})"
-            
+
             status_text.text(status_msg)
-            
+
             # Show detailed progress
             detail_parts = []
             if details.get("step"):
@@ -1308,7 +1311,7 @@ def show_tender_check_tab():
                 detail_parts.append(f"Current: {details['current_requirement']}")
             if detail_parts:
                 progress_details.text(" | ".join(detail_parts))
-            
+
             # Update per-requirement status
             if step_name == "check" and details.get("current_requirement"):
                 req_id = details["current_requirement"]
