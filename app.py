@@ -1520,69 +1520,69 @@ def show_tender_check_tab():
                 st.info("No issues match the selected filters.")
             else:
                 for issue in filtered_issues:
-                severity_color = {
-                    "CRITICAL": "🔴",
-                    "MODERATE": "🟡",
-                    "MINOR": "🟢"
-                }.get(issue.get("severity", ""), "⚪")
+                    severity_color = {
+                        "CRITICAL": "🔴",
+                        "MODERATE": "🟡",
+                        "MINOR": "🟢"
+                    }.get(issue.get("severity", ""), "⚪")
 
-                issue_type = issue.get("issue_type", "N/A")
-                req_id = issue.get("requirement_id", "N/A")
+                    issue_type = issue.get("issue_type", "N/A")
+                    req_id = issue.get("requirement_id", "N/A")
 
-                st.markdown(f"{severity_color} **{req_id}** - {issue_type}")
-                st.caption(issue.get("description", ""))
-                st.caption(f"**Impact:** {issue.get('impact', 'N/A')}")
+                    st.markdown(f"{severity_color} **{req_id}** - {issue_type}")
+                    st.caption(issue.get("description", ""))
+                    st.caption(f"**Impact:** {issue.get('impact', 'N/A')}")
 
-                # Show the full underlying requirement text (if available)
-                requirement = requirements_by_id.get(req_id) if requirements else None
-                if requirement:
-                    with st.expander("View full requirement", expanded=False):
-                        st.write(requirement.get("requirement_text", ""))
+                    # Show the full underlying requirement text (if available)
+                    requirement = requirements_by_id.get(req_id) if requirements else None
+                    if requirement:
+                        with st.expander("View full requirement", expanded=False):
+                            st.write(requirement.get("requirement_text", ""))
 
-                # Surface more granular details from omission / contradiction agents
-                if issue_type == "OMISSION":
-                    omission = omission_by_id.get(req_id)
-                    if omission:
-                        st.markdown("**Omission details**")
-                        st.write(
-                            f"Status: {omission.get('status', 'UNKNOWN')} "
-                            f"(confidence: {omission.get('confidence', 0.0):.2f})"
-                        )
-                        missing = omission.get("missing_elements") or []
-                        if missing:
-                            st.write("Missing elements:")
-                            for item in missing:
-                                st.write(f"- {item}")
-                        citations = omission.get("citations") or []
-                        if citations:
-                            with st.expander("Supporting citations from reference documents", expanded=False):
-                                for cit in citations:
-                                    doc_ref = cit.get("document_reference", "Unknown document")
-                                    src = cit.get("source_text", "")
-                                    st.markdown(f"- *{doc_ref}*: {src}")
+                    # Surface more granular details from omission / contradiction agents
+                    if issue_type == "OMISSION":
+                        omission = omission_by_id.get(req_id)
+                        if omission:
+                            st.markdown("**Omission details**")
+                            st.write(
+                                f"Status: {omission.get('status', 'UNKNOWN')} "
+                                f"(confidence: {omission.get('confidence', 0.0):.2f})"
+                            )
+                            missing = omission.get("missing_elements") or []
+                            if missing:
+                                st.write("Missing elements:")
+                                for item in missing:
+                                    st.write(f"- {item}")
+                            citations = omission.get("citations") or []
+                            if citations:
+                                with st.expander("Supporting citations from reference documents", expanded=False):
+                                    for cit in citations:
+                                        doc_ref = cit.get("document_reference", "Unknown document")
+                                        src = cit.get("source_text", "")
+                                        st.markdown(f"- *{doc_ref}*: {src}")
 
-                elif issue_type == "CONTRADICTION":
-                    contradiction = contradiction_by_id.get(req_id)
-                    if contradiction:
-                        st.markdown("**Contradiction details**")
-                        st.write(f"Severity: {contradiction.get('severity', 'NO_CONTRADICTION')}")
-                        details = contradiction.get("contradiction_details", "")
-                        if details:
-                            st.write(details)
-                        ref_guideline = contradiction.get("reference_guideline")
-                        if ref_guideline:
-                            st.write(f"Reference guideline: {ref_guideline}")
-                        tender_stmt = contradiction.get("tender_statement")
-                        if tender_stmt:
-                            st.write(f"Tender statement: {tender_stmt}")
-                        citations = contradiction.get("citations") or []
-                        if citations:
-                            with st.expander("Supporting citations from guidelines", expanded=False):
-                                for cit in citations:
-                                    doc_ref = cit.get("document_reference", "Unknown document")
-                                    src = cit.get("source_text", "")
-                                    st.markdown(f"- *{doc_ref}*: {src}")
-        
+                    elif issue_type == "CONTRADICTION":
+                        contradiction = contradiction_by_id.get(req_id)
+                        if contradiction:
+                            st.markdown("**Contradiction details**")
+                            st.write(f"Severity: {contradiction.get('severity', 'NO_CONTRADICTION')}")
+                            details = contradiction.get("contradiction_details", "")
+                            if details:
+                                st.write(details)
+                            ref_guideline = contradiction.get("reference_guideline")
+                            if ref_guideline:
+                                st.write(f"Reference guideline: {ref_guideline}")
+                            tender_stmt = contradiction.get("tender_statement")
+                            if tender_stmt:
+                                st.write(f"Tender statement: {tender_stmt}")
+                            citations = contradiction.get("citations") or []
+                            if citations:
+                                with st.expander("Supporting citations from guidelines", expanded=False):
+                                    for cit in citations:
+                                        doc_ref = cit.get("document_reference", "Unknown document")
+                                        src = cit.get("source_text", "")
+                                        st.markdown(f"- *{doc_ref}*: {src}")
+
         # Recommendations
         recommendations = final_report.get("recommendations", [])
         if recommendations:
