@@ -18,7 +18,17 @@ from utils.ai_processing import (
 from utils.ui_components import display_chunks_metadata, display_result, enrich_citation_with_doc_info
 from utils.pdf_processor import extract_text_from_pdf
 from utils.logging import log
-from config.config import OPENAI_MODEL, PROJECT_IDS
+from config.config import OPENAI_MODEL
+
+try:
+    from config.config import PROJECT_IDS
+except ImportError:
+    PROJECT_IDS = {
+        "Building services": "fda85e04-3a9c-4e6f-8af0-35bfcb1ba4e0",
+        "Tender requirement": "1375eed6-8f48-41c2-bd92-444e6acc7721",
+        "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63",
+        "Tender_handbook": "05ac317c-e700-4d5b-a99e-a1a92fc619e5",
+    }
 from tender_checker.workflow import TenderCheckWorkflow
 from tender_checker.prompts.agent_prompts import (
     BREAKDOWN_AGENT_PROMPT,
