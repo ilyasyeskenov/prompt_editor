@@ -1,4 +1,6 @@
 """Main Streamlit application for Requirement Checker."""
+import io
+import time
 import streamlit as st
 import pandas as pd
 import json
@@ -17,9 +19,14 @@ from utils.ai_processing import (
     process_requirement_with_chunks
 )
 from utils.ui_components import display_chunks_metadata, display_result, enrich_citation_with_doc_info
-from utils.pdf_processor import extract_text_from_pdf
+from utils.pdf_processor import extract_text_from_pdf, extract_text_from_pdf_with_llamaparse
 from utils.logging import log
 from config.config import OPENAI_MODEL
+
+try:
+    from config.config import LLAMA_CLOUD_API_KEY
+except ImportError:
+    LLAMA_CLOUD_API_KEY = ""
 
 try:
     from config.config import PROJECT_IDS
@@ -30,7 +37,13 @@ except ImportError:
         "Tender Requirement-2": "00d06bf0-7572-4f23-aaec-46a9adad5e63",
         "Tender_handbook": "05ac317c-e700-4d5b-a99e-a1a92fc619e5",
     }
+try:
+    from config.config import PAGEINDEX_API_KEY, PAGEINDEX_CHAT_URL
+except (ImportError, AttributeError):
+    PAGEINDEX_API_KEY = ""
+    PAGEINDEX_CHAT_URL = "https://api.pageindex.ai/chat/completions"
 from tender_checker.workflow import TenderCheckWorkflow
+from clients.pageindex_client import PageIndexClient
 from tender_checker.prompts.agent_prompts import (
     BREAKDOWN_AGENT_PROMPT,
     OMISSION_CHECKER_PROMPT,
@@ -823,56 +836,90 @@ def show_tender_check_tab():
 
     if "tender_omission_prompt_to_apply" in st.session_state:
         new_val = st.session_state.tender_omission_prompt_to_apply
-        st.session_state["omission_prompt_editor"] = new_val
+        st.session_state["tender_omission_prompt_editor"] = new_val
         st.session_state.tender_omission_prompt = new_val
         del st.session_state.tender_omission_prompt_to_apply
 
     if "tender_contradiction_prompt_to_apply" in st.session_state:
         new_val = st.session_state.tender_contradiction_prompt_to_apply
-        st.session_state["contradiction_prompt_editor"] = new_val
+        st.session_state["tender_contradiction_prompt_editor"] = new_val
         st.session_state.tender_contradiction_prompt = new_val
         del st.session_state.tender_contradiction_prompt_to_apply
 
     if "tender_orchestrator_prompt_to_apply" in st.session_state:
         new_val = st.session_state.tender_orchestrator_prompt_to_apply
-        st.session_state["orchestrator_prompt_editor"] = new_val
+        st.session_state["tender_orchestrator_prompt_editor"] = new_val
         st.session_state.tender_orchestrator_prompt = new_val
         del st.session_state.tender_orchestrator_prompt_to_apply
     
-    # Project ID selection for tender checker
+    # Evidence source: RAG (Supabase chunks) or PageIndex Legacy Retrieval (no Chat API)
     st.markdown("---")
     st.subheader("📁 Project Configuration")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        reference_project = st.selectbox(
-            "Reference Documents Project",
-            options=list(PROJECT_IDS.keys()),
-            index=2,  # Default to 'Tender Requirement-2'
-            help="Project ID for reference documents (used for omission checking)",
-            key="tender_reference_project"
-        )
-        reference_project_id = PROJECT_IDS[reference_project]
-    
-    with col2:
-        guidelines_project = st.selectbox(
-            "Guidelines Project",
-            options=list(PROJECT_IDS.keys()),
-            index=2,  # Default to 'Tender Requirement-2'
-            help="Project ID for guidelines (used for contradiction checking). If same as reference, leave as is.",
-            key="tender_guidelines_project"
-        )
-        guidelines_project_id = PROJECT_IDS[guidelines_project]
-    
-    # Advanced settings
+    evidence_source = st.radio(
+        "Evidence source",
+        options=["RAG (Supabase chunks)", "PageIndex (Retrieval)"],
+        index=0,
+        help="RAG: retrieve chunks from Supabase. PageIndex: Legacy Retrieval API (submit query + poll) per requirement per doc → chunks (no Chat API).",
+        key="tender_evidence_source"
+    )
+    use_pageindex_chat = evidence_source == "PageIndex (Retrieval)"
+
+    if use_pageindex_chat:
+        if not (PAGEINDEX_API_KEY or "").strip():
+            st.warning("Set **PAGEINDEX_API_KEY** in `.env` to use PageIndex Retrieval.")
+        st.markdown("**PageIndex document IDs** (from [PageIndex](https://docs.pageindex.ai/endpoints) — upload PDFs to get `doc_id`s)")
+        col1, col2 = st.columns(2)
+        with col1:
+            reference_doc_id = st.text_input(
+                "Reference doc_id (omission)",
+                value=st.session_state.get("tender_reference_doc_id", "pi-cml3ep35803gd09qzoczvn1kr"),
+                help="PageIndex doc_id for the reference document",
+                key="tender_reference_doc_id"
+            )
+        with col2:
+            guidelines_doc_id = st.text_input(
+                "Guidelines doc_id (contradiction)",
+                value=st.session_state.get("tender_guidelines_doc_id", ""),
+                help="PageIndex doc_id for guidelines. Leave empty to use the reference doc for both.",
+                key="tender_guidelines_doc_id"
+            )
+        reference_project_id = ""  # not used in PageIndex path
+        guidelines_project_id = ""
+        top_k = 5  # not used
+        max_workers = 5
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            reference_project = st.selectbox(
+                "Reference Documents Project",
+                options=list(PROJECT_IDS.keys()),
+                index=2,
+                help="Project ID for reference documents (used for omission checking)",
+                key="tender_reference_project"
+            )
+            reference_project_id = PROJECT_IDS[reference_project]
+        with col2:
+            guidelines_project = st.selectbox(
+                "Guidelines Project",
+                options=list(PROJECT_IDS.keys()),
+                index=2,
+                help="Project ID for guidelines (used for contradiction checking). If same as reference, leave as is.",
+                key="tender_guidelines_project"
+            )
+            guidelines_project_id = PROJECT_IDS[guidelines_project]
+        reference_doc_id = ""
+        guidelines_doc_id = ""
+
+    # Advanced settings (RAG only: top_k and workers; PageIndex uses same workers for Chat calls)
     with st.expander("⚙️ Advanced Settings", expanded=False):
         top_k = st.slider(
             "Chunks per Requirement (top_k)",
             min_value=3,
             max_value=15,
             value=5,
-            help="Number of document chunks to retrieve per requirement",
-            key="tender_top_k"
+            help="Number of document chunks to retrieve per requirement (RAG only)",
+            key="tender_top_k",
+            disabled=use_pageindex_chat
         )
         max_workers = st.slider(
             "Parallel Workers",
@@ -882,6 +929,8 @@ def show_tender_check_tab():
             help="Number of parallel workers for requirement checking",
             key="tender_max_workers"
         )
+        if use_pageindex_chat:
+            top_k = 5
     
     st.markdown("---")
     
@@ -906,6 +955,7 @@ def show_tender_check_tab():
         )
         st.session_state.tender_breakdown_prompt = breakdown_prompt
         if st.button("🔄 Reset to Default", key="reset_breakdown_tender"):
+            st.session_state.tender_breakdown_prompt_editor = BREAKDOWN_AGENT_PROMPT
             st.session_state.tender_breakdown_prompt = BREAKDOWN_AGENT_PROMPT
             st.rerun()
         
@@ -986,13 +1036,14 @@ def show_tender_check_tab():
         st.markdown("**Omission Checker** - Checks if requirements are fulfilled")
         omission_prompt = st.text_area(
             "Omission Checker Prompt Template",
-            value=st.session_state.get("omission_prompt_editor", st.session_state.tender_omission_prompt),
+            value=st.session_state.get("tender_omission_prompt_editor", st.session_state.tender_omission_prompt),
             height=300,
             help="Use {{requirement_text}}, {{requirement_id}}, {{reference_chunks}} as placeholders",
-            key="omission_prompt_editor"
+            key="tender_omission_prompt_editor"
         )
         st.session_state.tender_omission_prompt = omission_prompt
         if st.button("🔄 Reset to Default", key="reset_omission_tender"):
+            st.session_state.tender_omission_prompt_editor = OMISSION_CHECKER_PROMPT
             st.session_state.tender_omission_prompt = OMISSION_CHECKER_PROMPT
             st.rerun()
         
@@ -1072,13 +1123,14 @@ def show_tender_check_tab():
         st.markdown("**Contradiction Checker** - Checks for contradictions with guidelines")
         contradiction_prompt = st.text_area(
             "Contradiction Checker Prompt Template",
-            value=st.session_state.get("contradiction_prompt_editor", st.session_state.tender_contradiction_prompt),
+            value=st.session_state.get("tender_contradiction_prompt_editor", st.session_state.tender_contradiction_prompt),
             height=300,
             help="Use {{requirement_text}}, {{requirement_id}}, {{reference_chunks}} as placeholders",
-            key="contradiction_prompt_editor"
+            key="tender_contradiction_prompt_editor"
         )
         st.session_state.tender_contradiction_prompt = contradiction_prompt
         if st.button("🔄 Reset to Default", key="reset_contradiction_tender"):
+            st.session_state.tender_contradiction_prompt_editor = CONTRADICTION_CHECKER_PROMPT
             st.session_state.tender_contradiction_prompt = CONTRADICTION_CHECKER_PROMPT
             st.rerun()
         
@@ -1158,13 +1210,14 @@ def show_tender_check_tab():
         st.markdown("**Orchestrator** - Synthesizes final compliance report")
         orchestrator_prompt = st.text_area(
             "Orchestrator Prompt Template",
-            value=st.session_state.get("orchestrator_prompt_editor", st.session_state.tender_orchestrator_prompt),
+            value=st.session_state.get("tender_orchestrator_prompt_editor", st.session_state.tender_orchestrator_prompt),
             height=300,
             help="Use {{tender_summary}}, {{omission_results}}, {{contradiction_results}} as placeholders",
-            key="orchestrator_prompt_editor"
+            key="tender_orchestrator_prompt_editor"
         )
         st.session_state.tender_orchestrator_prompt = orchestrator_prompt
         if st.button("🔄 Reset to Default", key="reset_orchestrator_tender"):
+            st.session_state.tender_orchestrator_prompt_editor = ORCHESTRATOR_PROMPT
             st.session_state.tender_orchestrator_prompt = ORCHESTRATOR_PROMPT
             st.rerun()
         
@@ -1257,70 +1310,110 @@ def show_tender_check_tab():
     
     st.markdown("---")
     
-    # Process Button
+    # Live progress: workflow runs in background thread; we poll and show steps
+    STEP_LABELS = {
+        1: "Breaking down tender",
+        2: "Retrieving reference documents",
+        3: "Checking requirements",
+        4: "Synthesizing results",
+    }
+
+    def _render_live_progress(prog: Dict[str, Any]):
+        """Render progress bar and step list from progress store (main thread only)."""
+        prog = prog or {}
+        step_num = prog.get("step_num", 0)
+        total_steps = prog.get("total_steps", 4)
+        details = prog.get("details") or {}
+        progress_pct = int((step_num / total_steps) * 100) if total_steps else 0
+        st.progress(min(progress_pct, 100) / 100.0)
+        st.markdown("**Steps**")
+        for i in range(1, total_steps + 1):
+            label = STEP_LABELS.get(i, f"Step {i}")
+            if i == step_num and i == 2 and details.get("step"):
+                label = details["step"]
+            if i < step_num:
+                st.markdown(f"- ✅ **Step {i}/{total_steps}:** {label}")
+            elif i == step_num:
+                extra = ""
+                if details.get("completed") is not None and details.get("total_requirements"):
+                    extra = f" ({details['completed']}/{details['total_requirements']})"
+                if details.get("current_requirement"):
+                    extra += f" — *{details['current_requirement']}*"
+                st.markdown(f"- 🔄 **Step {i}/{total_steps}:** {label}{extra}")
+            else:
+                st.markdown(f"- ⏳ **Step {i}/{total_steps}:** {label} (pending)")
+
+    # Process Button: extract PDF, start workflow in thread, rerun to show progress
     if st.button("🚀 Check Tender Submission", type="primary", key="check_tender_btn"):
         if not uploaded_pdf:
             st.error("Please upload a PDF document first.")
             return
-        
-        # Extract text from PDF
-        with st.spinner("Extracting text from PDF..."):
-            tender_text = extract_text_from_pdf(uploaded_pdf)
+
+        pdf_bytes = uploaded_pdf.read()
+        if not pdf_bytes:
+            st.error("PDF file is empty.")
+            return
+        use_llamaparse = bool(LLAMA_CLOUD_API_KEY and LLAMA_CLOUD_API_KEY.strip())
+        with st.spinner(
+            "Parsing PDF with LlamaParse (layout + tables)..."
+            if use_llamaparse
+            else "Extracting text from PDF..."
+        ):
+            tender_text = None
+            if use_llamaparse:
+                class _PdfBytes:
+                    read = lambda self: pdf_bytes
+                    name = getattr(uploaded_pdf, "name", "document.pdf") or "document.pdf"
+                tender_text = extract_text_from_pdf_with_llamaparse(_PdfBytes())
+                if tender_text:
+                    st.success(f"✓ LlamaParse: extracted {len(tender_text)} characters (layout-aware)")
+            if not tender_text:
+                tender_text = extract_text_from_pdf(io.BytesIO(pdf_bytes))
+                if tender_text:
+                    st.success(f"✓ Extracted {len(tender_text)} characters from PDF")
             if not tender_text:
                 st.error("Failed to extract text from PDF. Please try again.")
                 return
-            st.success(f"✓ Extracted {len(tender_text)} characters from PDF")
-        
-        # Initialize progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        progress_details = st.empty()
-        per_req_status = st.empty()
-        
-        # Track per-requirement status
-        if "tender_progress_status" not in st.session_state:
-            st.session_state.tender_progress_status = {}
-        
+
+        # Prompt sanity checks (prevents silent empty extractions)
+        if "{{tender_text}}" not in st.session_state.tender_breakdown_prompt:
+            st.error("Breakdown prompt is missing the {{tender_text}} placeholder.")
+            st.info("Add {{tender_text}} to the Breakdown prompt so the model sees the uploaded document.")
+            return
+        if "requirements" not in st.session_state.tender_breakdown_prompt.lower():
+            st.warning("Breakdown prompt does not mention 'requirements'. This can lead to empty outputs.")
+
+        # Thread-safe progress and result holders (background thread must NOT touch st.session_state)
+        progress_store: Dict[str, Any] = {}
+        progress_lock = threading.Lock()
+        result_holder: Dict[str, Any] = {"done": False, "result": None, "error": None}
+
         def progress_callback(step_name: str, step_num: int, total_steps: int, details: Dict[str, Any]):
-            """Callback for workflow progress updates. Only updates Streamlit UI from the main thread."""
-            if threading.current_thread() is not threading.main_thread():
+            with progress_lock:
+                progress_store.update({
+                    "step_name": step_name,
+                    "step_num": step_num,
+                    "total_steps": total_steps,
+                    "details": details,
+                })
+
+        pageindex_client = None
+        if use_pageindex_chat and (PAGEINDEX_API_KEY or "").strip():
+            try:
+                pageindex_client = PageIndexClient(
+                    api_key=PAGEINDEX_API_KEY.strip(),
+                    chat_url=PAGEINDEX_CHAT_URL or "https://api.pageindex.ai/chat/completions",
+                )
+            except Exception as e:
+                st.error(f"Failed to create PageIndex client: {str(e)}")
                 return
-            progress_pct = int((step_num / total_steps) * 100)
-            progress_bar.progress(progress_pct)
+        if use_pageindex_chat and not pageindex_client:
+            st.error("PageIndex (Retrieval) selected but PAGEINDEX_API_KEY is not set. Set it in .env or switch to RAG.")
+            return
+        if use_pageindex_chat and not (reference_doc_id or "").strip():
+            st.error("PageIndex (Retrieval) selected but Reference doc_id is empty. Enter a PageIndex doc_id.")
+            return
 
-            step_labels = {
-                "breakdown": "Breaking down tender",
-                "retrieval": "Retrieving reference documents",
-                "check": "Checking requirements",
-                "orchestrate": "Synthesizing results"
-            }
-
-            step_label = step_labels.get(step_name, step_name)
-            status_msg = f"🔄 Step {step_num}/{total_steps}: {step_label}"
-
-            if details.get("completed") is not None and details.get("total_requirements"):
-                status_msg += f" ({details['completed']}/{details['total_requirements']})"
-
-            status_text.text(status_msg)
-
-            # Show detailed progress
-            detail_parts = []
-            if details.get("step"):
-                detail_parts.append(details["step"])
-            if details.get("current_requirement"):
-                detail_parts.append(f"Current: {details['current_requirement']}")
-            if detail_parts:
-                progress_details.text(" | ".join(detail_parts))
-
-            # Update per-requirement status
-            if step_name == "check" and details.get("current_requirement"):
-                req_id = details["current_requirement"]
-                st.session_state.tender_progress_status[req_id] = {
-                    "step": "checking",
-                    "status": "in_progress"
-                }
-        
-        # Initialize workflow
         try:
             workflow = TenderCheckWorkflow(
                 ai_client=st.session_state.ai_client,
@@ -1329,41 +1422,70 @@ def show_tender_check_tab():
                 omission_prompt=st.session_state.tender_omission_prompt,
                 contradiction_prompt=st.session_state.tender_contradiction_prompt,
                 orchestrator_prompt=st.session_state.tender_orchestrator_prompt,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                pageindex_client=pageindex_client,
             )
         except Exception as e:
             st.error(f"Failed to initialize workflow: {str(e)}")
             return
-        
-        try:
-            # Run workflow
-            result = workflow.run(
-                tender_text=tender_text,
-                project_id=reference_project_id,
-                guidelines_project_id=guidelines_project_id if guidelines_project_id != reference_project_id else None,
-                top_k=top_k
-            )
-            
-            progress_bar.progress(100)
-            status_text.text("✅ Complete!")
-            progress_details.empty()
-            per_req_status.empty()
-            
-            # Store result in session state
-            st.session_state.tender_check_result = result
-            st.session_state.tender_progress_status = {}  # Clear progress status
-            
-        except Exception as e:
-            progress_bar.empty()
-            status_text.empty()
-            progress_details.empty()
-            per_req_status.empty()
-            st.error(f"Error during tender checking: {str(e)}")
-            import traceback
-            with st.expander("Error Details"):
-                st.code(traceback.format_exc())
-            return
-    
+
+        st.session_state["tender_workflow_running"] = True
+        st.session_state["tender_progress_store"] = progress_store
+        st.session_state["tender_result_holder"] = result_holder
+        _ref_id = reference_project_id
+        _guid_id = guidelines_project_id if (not use_pageindex_chat and guidelines_project_id != reference_project_id) else None
+        _ref_doc_id = (reference_doc_id or "").strip()
+        _guid_doc_id = (guidelines_doc_id or "").strip()
+
+        def run_workflow():
+            try:
+                result = workflow.run(
+                    tender_text=tender_text,
+                    project_id=_ref_id or "n/a",
+                    guidelines_project_id=_guid_id,
+                    top_k=top_k,
+                    use_pageindex_chat=use_pageindex_chat,
+                    reference_doc_id=_ref_doc_id,
+                    guidelines_doc_id=_guid_doc_id,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = str(e)
+            finally:
+                result_holder["done"] = True
+
+        t = threading.Thread(target=run_workflow, daemon=True)
+        t.start()
+        st.rerun()
+
+    # Poll: show live progress while workflow runs, then show result when done (main thread only)
+    if st.session_state.get("tender_workflow_running"):
+        result_holder = st.session_state.get("tender_result_holder") or {}
+        if result_holder.get("done"):
+            st.session_state["tender_workflow_running"] = False
+            err = result_holder.get("error")
+            if err:
+                st.session_state["tender_workflow_error_display"] = err
+            else:
+                st.session_state["tender_check_result"] = result_holder.get("result")
+            st.session_state.pop("tender_progress_store", None)
+            st.session_state.pop("tender_result_holder", None)
+            st.rerun()
+        else:
+            progress_store = st.session_state.get("tender_progress_store") or {}
+            prog = dict(progress_store)  # snapshot for display (main thread only)
+            _render_live_progress(prog)
+            st.caption("Refreshing in 1 second…")
+            time.sleep(1)
+            st.rerun()
+
+    # Show workflow error from previous run (after rerun)
+    if st.session_state.get("tender_workflow_error_display"):
+        st.error("Error during tender checking: " + st.session_state["tender_workflow_error_display"])
+        with st.expander("Error Details"):
+            st.code(st.session_state["tender_workflow_error_display"])
+        st.session_state.pop("tender_workflow_error_display", None)
+
     # Display Results
     if "tender_check_result" in st.session_state:
         result = st.session_state.tender_check_result
@@ -1391,6 +1513,12 @@ def show_tender_check_tab():
         # Requirements Breakdown
         requirements = result.get("requirements", [])
         requirements_by_id = {}
+        if not requirements:
+            st.warning(
+                "No requirements were extracted. This usually means the Breakdown prompt is mis-specified. "
+                "Ensure it instructs the model to extract requirements from the uploaded tender document "
+                "and returns JSON with a `requirements` array."
+            )
         if requirements:
             # Build lookup for later sections (e.g. Critical Issues)
             for i, req in enumerate(requirements, 1):
@@ -1415,7 +1543,7 @@ def show_tender_check_tab():
                     key="req_sort_by"
                 )
             with col3:
-                show_all = st.checkbox("Show all requirements", value=False, key="req_show_all")
+                show_all = st.checkbox("Show all requirements", value=True, key="req_show_all")
             
             # Filter and sort requirements
             filtered_requirements = requirements

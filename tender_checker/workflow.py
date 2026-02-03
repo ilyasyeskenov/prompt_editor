@@ -15,6 +15,16 @@ RETRIEVAL_BATCH_SIZE = 15
 RETRIEVAL_MAX_WORKERS = 10
 OPENAI_CONCURRENCY = 5
 
+# PageIndex Chat prompts for omission/contradiction (answer-over-doc)
+PAGEINDEX_OMISSION_QUESTION = (
+    "Does this document state or imply the following requirement? "
+    "Quote the relevant parts. Answer: fulfilled / partially / not fulfilled.\n\nRequirement: {requirement_text}"
+)
+PAGEINDEX_CONTRADICTION_QUESTION = (
+    "Does this guideline document contradict or conflict with the following requirement? "
+    "Quote any conflicting parts. Answer: no contradiction / minor / moderate / critical contradiction.\n\nRequirement: {requirement_text}"
+)
+
 
 def normalize_requirement_ids(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -81,6 +91,10 @@ class TenderCheckState(TypedDict):
     guidelines_project_id: str
     top_k: int
     error: str
+    # PageIndex Chat (Option B): when True, retrieval uses PageIndex Chat API instead of Supabase RAG
+    use_pageindex_chat: bool
+    reference_doc_id: str
+    guidelines_doc_id: str
     
 class TenderCheckWorkflow:
     """LangGraph workflow for tender checking with fan-out retrieval and single fan-in to orchestrate."""
@@ -97,9 +111,11 @@ class TenderCheckWorkflow:
         retrieval_max_workers: int = RETRIEVAL_MAX_WORKERS,
         openai_concurrency: int = OPENAI_CONCURRENCY,
         progress_callback: Optional[Callable[[str, int, int, Dict[str, Any]], None]] = None,
+        pageindex_client: Optional[Any] = None,
     ):
         self.ai_client = ai_client
         self.supabase_client = supabase_client
+        self.pageindex_client = pageindex_client
         self.retrieval_batch_size = retrieval_batch_size
         self.retrieval_max_workers = retrieval_max_workers
         self.openai_semaphore = threading.Semaphore(openai_concurrency)
@@ -198,19 +214,104 @@ class TenderCheckWorkflow:
             "contradiction_chunks": contradiction_chunks,
         }
 
+    def _retrieve_one_pageindex(
+        self,
+        requirement: Dict[str, Any],
+        reference_doc_id: str,
+        guidelines_doc_id: str,
+    ) -> Dict[str, Any]:
+        """Retrieve omission and contradiction evidence via PageIndex Legacy Retrieval API (submit + poll → chunks)."""
+        req_text = requirement.get("requirement_text", "")
+        omission_q = PAGEINDEX_OMISSION_QUESTION.format(requirement_text=req_text)
+        contradiction_q = PAGEINDEX_CONTRADICTION_QUESTION.format(requirement_text=req_text)
+        omission_chunks = []
+        contradiction_chunks = []
+        try:
+            omission_chunks = self.pageindex_client.retrieve(
+                doc_id=reference_doc_id,
+                query=omission_q,
+                file_name="PageIndex Reference",
+            )
+        except Exception:
+            omission_chunks = []
+        try:
+            con_doc_id = guidelines_doc_id or reference_doc_id
+            contradiction_chunks = self.pageindex_client.retrieve(
+                doc_id=con_doc_id,
+                query=contradiction_q,
+                file_name="PageIndex Guidelines",
+            )
+        except Exception:
+            contradiction_chunks = []
+        return {
+            "requirement": requirement,
+            "omission_chunks": omission_chunks,
+            "contradiction_chunks": contradiction_chunks,
+        }
+
     def _retrieval_node(self, state: TenderCheckState) -> Dict[str, Any]:
-        """Parallel retrieval (Supabase) for all requirements in batches; single output for downstream check."""
+        """Parallel retrieval: either Supabase RAG (chunks) or PageIndex Legacy Retrieval (chunks)."""
         requirements = state.get("requirements", [])
         if not requirements:
             return {"retrieval_results": []}
 
+        use_pageindex = state.get("use_pageindex_chat", False) and self.pageindex_client
+        reference_doc_id = (state.get("reference_doc_id") or "").strip()
+        guidelines_doc_id = (state.get("guidelines_doc_id") or "").strip()
+
         if self.progress_callback:
+            step_label = "PageIndex Retrieval" if use_pageindex else "Retrieving chunks"
             self.progress_callback("retrieval", 2, 4, {
-                "step": "Starting retrieval",
+                "step": step_label,
                 "total_requirements": len(requirements),
                 "completed": 0
             })
 
+        if use_pageindex and reference_doc_id:
+            # PageIndex Legacy Retrieval path: submit + poll per requirement per doc → chunks
+            batch_size = min(self.retrieval_batch_size, len(requirements))
+            max_workers = min(self.retrieval_max_workers, len(requirements))
+            results = [None] * len(requirements)
+            completed_count = 0
+            for start in range(0, len(requirements), batch_size):
+                batch = requirements[start : start + batch_size]
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_idx = {
+                        executor.submit(
+                            self._retrieve_one_pageindex,
+                            req,
+                            reference_doc_id,
+                            guidelines_doc_id,
+                        ): start + i
+                        for i, req in enumerate(batch)
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        try:
+                            results[idx] = future.result()
+                            completed_count += 1
+                            if self.progress_callback:
+                                self.progress_callback("retrieval", 2, 4, {
+                                    "step": "PageIndex Retrieval",
+                                    "total_requirements": len(requirements),
+                                    "completed": completed_count
+                                })
+                        except Exception:
+                            results[idx] = {
+                                "requirement": requirements[idx],
+                                "omission_chunks": [],
+                                "contradiction_chunks": [],
+                            }
+                            completed_count += 1
+            if self.progress_callback:
+                self.progress_callback("retrieval", 2, 4, {
+                    "step": "PageIndex Retrieval complete",
+                    "total_requirements": len(requirements),
+                    "completed": completed_count
+                })
+            return {"retrieval_results": results}
+
+        # Supabase RAG path (existing)
         project_id = state["project_id"]
         guidelines_id = state.get("guidelines_project_id", project_id)
         top_k = state.get("top_k", 8)
@@ -397,16 +498,22 @@ class TenderCheckWorkflow:
         tender_text: str,
         project_id: str,
         guidelines_project_id: str = None,
-        top_k: int = 8
+        top_k: int = 8,
+        use_pageindex_chat: bool = False,
+        reference_doc_id: str = "",
+        guidelines_doc_id: str = "",
     ) -> Dict[str, Any]:
         """
         Run the complete tender checking workflow.
         
         Args:
             tender_text: Full text of tender submission
-            project_id: Project ID for reference documents (omission checking)
-            guidelines_project_id: Project ID for guidelines (contradiction checking). 
-                                  If None, uses project_id.
+            project_id: Project ID for reference documents (omission) — used when use_pageindex_chat is False
+            guidelines_project_id: Project ID for guidelines (contradiction) — used when use_pageindex_chat is False
+            top_k: Chunks per requirement (RAG mode only)
+            use_pageindex_chat: If True, use PageIndex Chat API instead of Supabase RAG
+            reference_doc_id: PageIndex doc_id for reference document (omission)
+            guidelines_doc_id: PageIndex doc_id for guidelines (contradiction); if empty, uses reference_doc_id
             
         Returns:
             Final state with all results
@@ -422,7 +529,10 @@ class TenderCheckWorkflow:
             "project_id": project_id,
             "guidelines_project_id": guidelines_project_id or project_id,
             "top_k": top_k,
-            "error": ""
+            "error": "",
+            "use_pageindex_chat": use_pageindex_chat,
+            "reference_doc_id": reference_doc_id or "",
+            "guidelines_doc_id": guidelines_doc_id or "",
         }
         
         # Run workflow
