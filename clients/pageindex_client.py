@@ -1,4 +1,4 @@
-"""PageIndex API client: Legacy Retrieval API (query doc, get chunks) and doc status."""
+"""PageIndex API client: document upload, status, tree, legacy retrieval."""
 import time
 import requests
 from typing import Optional, List, Union, Dict, Any
@@ -34,6 +34,67 @@ class PageIndexClient:
 
     def _headers(self) -> Dict[str, str]:
         return {"api_key": self.api_key, "Content-Type": "application/json"}
+
+    def upload_doc(
+        self,
+        file_bytes: bytes,
+        filename: str = "document.pdf",
+    ) -> str:
+        """
+        Upload a PDF to PageIndex for processing (tree generation). Returns doc_id.
+        """
+        if not self.api_key:
+            raise PageIndexError("PAGEINDEX_API_KEY is not set")
+        resp = requests.post(
+            f"{self.doc_base_url}/",
+            headers={"api_key": self.api_key},
+            files={"file": (filename, file_bytes, "application/pdf")},
+            timeout=120,
+        )
+        if resp.status_code == 401:
+            raise PageIndexError("PageIndex API key invalid or missing")
+        if resp.status_code != 200:
+            raise PageIndexError(
+                f"PageIndex upload error: {resp.status_code} - {resp.text[:500]}"
+            )
+        data = resp.json()
+        doc_id = data.get("doc_id")
+        if not doc_id:
+            raise PageIndexError("PageIndex upload returned no doc_id")
+        return doc_id
+
+    def is_retrieval_ready(self, doc_id: str) -> bool:
+        """
+        Check if the document is ready for retrieval (tree available).
+        Matches PageIndex SDK / API: check retrieval_ready or status=completed.
+        """
+        data = self.get_doc_status(doc_id)
+        if data.get("retrieval_ready"):
+            return True
+        if (data.get("status") or "").strip().lower() == "completed":
+            return True
+        return False
+
+    def poll_until_ready(
+        self,
+        doc_id: str,
+        poll_interval: float = 3.0,
+        max_wait: float = 300.0,
+    ) -> bool:
+        """
+        Poll GET doc/{doc_id}/?type=tree until the document is retrieval_ready.
+        Uses retrieval_ready or status=completed (per PageIndex API / SDK).
+        """
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            data = self.get_doc_status(doc_id)
+            if data.get("retrieval_ready") or (data.get("status") or "").strip().lower() == "completed":
+                return True
+            status = (data.get("status") or "").strip().lower()
+            if status and status not in ("processing", "pending", "queued", ""):
+                raise PageIndexError(f"PageIndex doc processing failed: status={status}")
+            time.sleep(poll_interval)
+        raise PageIndexError(f"PageIndex doc not retrieval_ready after {max_wait}s")
 
     def submit_retrieval(self, doc_id: str, query: str, thinking: bool = False) -> str:
         """POST /retrieval/ → returns retrieval_id."""
@@ -155,7 +216,8 @@ class PageIndexClient:
         """
         if not self.api_key:
             raise PageIndexError("PAGEINDEX_API_KEY is not set")
-        url = f"{self.doc_base_url}/{doc_id}/?type=tree"
+        # API: GET https://api.pageindex.ai/doc/{doc_id}/ with trailing slash
+        url = f"{self.doc_base_url.rstrip('/')}/{doc_id}/?type=tree"
         resp = requests.get(
             url,
             headers={"api_key": self.api_key},
@@ -168,3 +230,48 @@ class PageIndexClient:
                 f"PageIndex doc status error: {resp.status_code} - {resp.text[:500]}"
             )
         return resp.json()
+
+    def get_tree(self, doc_id: str, summary: bool = True, retry_if_not_ready: bool = True, max_retries: int = 3) -> List[Dict[str, Any]]:
+        """
+        Get PageIndex tree (node_id, title, text, summary?, nodes).
+        Only returns when retrieval_ready or status=completed (per API / SDK).
+        Returns a list of top-level nodes (single root wrapped in list if needed).
+        """
+        if not self.api_key:
+            raise PageIndexError("PAGEINDEX_API_KEY is not set")
+        # API: type=tree, summary (boolean) for node summaries
+        url = f"{self.doc_base_url.rstrip('/')}/{doc_id}/?type=tree"
+        if summary:
+            url += "&summary=true"
+        for attempt in range(max_retries):
+            resp = requests.get(
+                url,
+                headers={"api_key": self.api_key},
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                raise PageIndexError(
+                    f"PageIndex get_tree error: {resp.status_code} - {resp.text[:500]}"
+                )
+            data = resp.json()
+            # Only use tree when doc is ready (matches SDK is_retrieval_ready + get_tree)
+            if not data.get("retrieval_ready") and (data.get("status") or "").strip().lower() != "completed":
+                if not retry_if_not_ready or attempt == max_retries - 1:
+                    status = data.get("status", "unknown")
+                    raise PageIndexError(f"Document not retrieval_ready yet (status: {status}, attempt {attempt + 1}/{max_retries})")
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            result = data.get("result")
+            if result is None:
+                if not retry_if_not_ready or attempt == max_retries - 1:
+                    raise PageIndexError("Document ready but tree result is empty")
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            # API returns result as array of nodes; sometimes single root as one object
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                # Single root node (e.g. notebook "TENDER SUBMISSION"): wrap so we keep root
+                return [result]
+            return []
+        raise PageIndexError("Document not retrieval_ready after retries")

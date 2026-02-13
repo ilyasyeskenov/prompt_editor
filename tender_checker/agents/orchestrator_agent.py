@@ -55,8 +55,32 @@ class OrchestratorAgent:
                 temperature=0.1
             )
             
-            result = json.loads(response.choices[0].message.content)
-            return result
+            raw = (response.choices[0].message.content or "").strip()
+            result = json.loads(raw)
+            # Normalize to expected keys only (avoid KeyError from malformed/echoed keys)
+            if not isinstance(result, dict):
+                return {"overall_status": "ERROR", "compliance_score": 0.0, "summary": "Invalid response shape", "critical_issues": [], "omission_summary": {}, "contradiction_summary": {}, "recommendations": [], "risk_assessment": "Unable to assess"}
+            return {
+                "overall_status": result.get("overall_status", "UNKNOWN"),
+                "compliance_score": result.get("compliance_score", 0.0),
+                "summary": result.get("summary", "No summary available"),
+                "critical_issues": result.get("critical_issues") if isinstance(result.get("critical_issues"), list) else [],
+                "omission_summary": result.get("omission_summary") if isinstance(result.get("omission_summary"), dict) else {},
+                "contradiction_summary": result.get("contradiction_summary") if isinstance(result.get("contradiction_summary"), dict) else {},
+                "recommendations": result.get("recommendations") if isinstance(result.get("recommendations"), list) else [],
+                "risk_assessment": result.get("risk_assessment", "Unable to assess risk"),
+            }
+        except json.JSONDecodeError as e:
+            return {
+                "overall_status": "ERROR",
+                "compliance_score": 0.0,
+                "summary": f"Orchestrator returned invalid JSON: {str(e)}",
+                "critical_issues": [],
+                "omission_summary": {},
+                "contradiction_summary": {},
+                "recommendations": [],
+                "risk_assessment": "Unable to assess risk due to JSON error"
+            }
         except Exception as e:
             return {
                 "overall_status": "ERROR",

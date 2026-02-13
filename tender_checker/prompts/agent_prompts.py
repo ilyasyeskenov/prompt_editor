@@ -1,11 +1,49 @@
 """Prompts for tender checking agents."""
 
-BREAKDOWN_AGENT_PROMPT = """You are a Senior Contract Strategist and Requirements Engineer. Your task is to decompose a tender submission document into granular requirements that need to be verified.
+# Used when PageIndex mode and no submission_doc_id: split submission text into sections for section-by-section checking
+SECTION_EXTRACTION_PROMPT = """You are a document analyst. Your task is to split the following submission document into logical sections.
 
-Analyze the provided tender document and extract ALL requirements that must be checked for compliance. Each requirement should be:
+Identify clear sections (e.g. by headings, numbered clauses, or topic changes). Each section should have a short title and the full text content of that section. Do not merge unrelated topics into one section; do not split a single heading into multiple sections.
+
+Return your analysis as a JSON object with this structure only:
+
+```json
+{
+  "sections": [
+    {
+      "section_id": "SEC-1",
+      "title": "Short section title or heading",
+      "content": "Full text of this section as it appears in the document."
+    }
+  ]
+}
+```
+
+Submission document:
+{{tender_text}}
+
+Return only the JSON object, no other text."""
+
+# Parse reference document context into a list of distinct requirement strings (Requirement Text from reference)
+REQUIREMENTS_LIST_EXTRACTION_PROMPT = """You are an analyst. The following text is from a reference document (e.g. handbook) and describes requirements that a submission must comply with.
+
+Extract every distinct requirement as a separate item. Each item should be one clear, verifiable obligation or criterion. Do not split a single sentence into multiple items. Do not merge unrelated requirements.
+
+Return a JSON object with a single key "requirements" whose value is an array of strings. Each string is one requirement statement.
+
+Reference text:
+{{reference_text}}
+
+Return only valid JSON, e.g. {"requirements": ["Requirement one.", "Requirement two."]}"""
+
+BREAKDOWN_AGENT_PROMPT = """You are a Senior Contract Strategist and Requirements Engineer. Your task is to decompose a tender submission document into requirements that need to be verified.
+
+**What counts as one requirement:** One requirement = one distinct, verifiable obligation or criterion (something that can be checked for compliance). Do not split a single sentence into multiple requirements. Do not merge unrelated obligations into one requirement. If a clause has several sub-bullets that each state a distinct obligation, treat each as a separate requirement; if they restate the same obligation, keep as one.
+
+Analyze the provided tender document and extract every such requirement. Each requirement should be:
 - Specific and verifiable
 - Self-contained
-- Include context (what, who, when, where)
+- Include context (what, who, when, where) where helpful
 
 Return your analysis as a JSON object with the following structure:
 
@@ -27,71 +65,79 @@ Tender Document:
 
 Extract all requirements that need to be verified against reference documents."""
 
-OMISSION_CHECKER_PROMPT = """You are a Compliance Auditor specializing in tender submission verification. Your task is to check if a specific requirement is fulfilled in the reference documents.
+OMISSION_CHECKER_PROMPT = """You are a Compliance Auditor. Your task is to determine whether a specific requirement from the reference document is supported by evidence in the submission material below.
 
-**Requirement to Check:**
+**Reference requirement (to check for supporting evidence):**
 {{requirement_text}}
 
-**Reference Documents:**
+**Submission material (evidence):**
+The text below is the submission content (sentence text / section) to check. Consider all of it carefully.
+
 {{reference_chunks}}
 
-**Instructions:**
-1. Analyze the requirement carefully
-2. Search the reference documents for evidence that fulfills this requirement
-3. Determine if the requirement is FULFILLED, PARTIALLY_FULFILLED, or NOT_FULFILLED
-4. Provide specific citations from the reference documents
+**Rules:**
+- Base your judgment only on the submission material above. Do not assume or infer content that is not present.
+- FULFILLED: The submission material clearly states or implies the reference requirement; you can cite specific supporting text.
+- PARTIALLY_FULFILLED: The submission material addresses only part of the reference requirement; cite what is covered and what is missing.
+- NOT_FULFILLED: The submission material does not support the reference requirement, or is silent on it. If nothing above is relevant, choose NOT_FULFILLED and state clearly that there is no supporting evidence in the provided material.
+- Every citation must be an exact quote from the submission material. Do not paraphrase in citations.
+- If you find no relevant evidence, say so explicitly in the justification and return an empty or minimal citations list.
 
-Return your analysis as JSON:
+Return your analysis as JSON only:
 
 ```json
 {
   "requirement_id": "{{requirement_id}}",
   "status": "FULFILLED" | "PARTIALLY_FULFILLED" | "NOT_FULFILLED",
   "confidence": 0.0-1.0,
-  "justification": "Detailed explanation",
+  "justification": "Clear explanation based only on the reference material above.",
   "citations": [
     {
-      "source_text": "Exact quote from reference document",
-      "document_reference": "Document name and page number",
-      "relevance": "How this citation relates to the requirement"
+      "source_text": "Exact quote from submission material",
+      "document_reference": "Submission section name and page number",
+      "relevance": "How this citation supports the reference requirement"
     }
   ],
-  "missing_elements": ["List of missing elements if partially or not fulfilled"]
+  "missing_elements": ["Only if PARTIALLY_FULFILLED or NOT_FULFILLED: what is missing or unsupported"]
 }
 ```"""
 
-CONTRADICTION_CHECKER_PROMPT = """You are a Compliance Auditor specializing in identifying contradictions between tender submissions and reference guidelines. Your task is to check if the tender submission contradicts any reference guidelines.
+CONTRADICTION_CHECKER_PROMPT = """You are a Compliance Auditor. Your task is to determine whether the submission statement below contradicts or conflicts with the reference guidelines.
 
-**Requirement/Statement to Check:**
+**Submission statement to check:**
 {{requirement_text}}
 
-**Reference Guidelines:**
+**Reference guidelines:**
+The text below is the reference/guideline content. Consider all of it carefully.
+
 {{reference_chunks}}
 
-**Instructions:**
-1. Analyze the requirement/statement from the tender
-2. Compare it against the reference guidelines
-3. Identify any contradictions, conflicts, or violations
-4. Determine severity: CRITICAL, MODERATE, MINOR, or NO_CONTRADICTION
-5. Provide specific evidence of contradictions
+**Rules:**
+- Base your judgment only on the material above. A contradiction must be explicit or clearly implied: the submission says X, the reference guideline says or implies not-X (or the opposite).
+- CRITICAL: Direct conflict with a mandatory rule or safety/legal requirement.
+- MODERATE: Clear conflict with a stated guideline or standard.
+- MINOR: Tension or ambiguity that could be resolved with clarification.
+- NO_CONTRADICTION: The guidelines do not conflict with the requirement, or the provided material does not address it. If nothing above contradicts the requirement, choose NO_CONTRADICTION and state clearly that there is no evidence of conflict in the provided material.
+- Every citation must be an exact quote. Do not paraphrase in citations.
+- If you find no contradiction, say so explicitly in contradiction_details and return empty or minimal citations.
 
-Return your analysis as JSON:
+Return your analysis as JSON only:
 
 ```json
 {
   "requirement_id": "{{requirement_id}}",
   "has_contradiction": true | false,
   "severity": "CRITICAL" | "MODERATE" | "MINOR" | "NO_CONTRADICTION",
-  "contradiction_details": "Description of the contradiction",
-  "reference_guideline": "The specific guideline that is contradicted",
-  "tender_statement": "The statement from tender that contradicts",
+  "contradiction_details": "Clear description of the contradiction, or statement that no conflict was found in the provided material.",
+  "reference_guideline": "Exact guideline text or clause that is contradicted (if any)",
+  "tender_statement": "The part of the requirement that conflicts (if any)",
   "citations": [
     {
       "source_text": "Exact quote from reference guideline",
       "document_reference": "Document name and page number"
     }
   ],
-  "recommendation": "What needs to be corrected"
+  "recommendation": "Concrete action to resolve the contradiction, or 'No change required' if NO_CONTRADICTION"
 }
 ```"""
 

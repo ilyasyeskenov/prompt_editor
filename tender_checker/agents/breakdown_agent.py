@@ -39,7 +39,7 @@ class BreakdownAgent:
                     }
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
+                temperature=0,
             )
             
             result = json.loads(response.choices[0].message.content)

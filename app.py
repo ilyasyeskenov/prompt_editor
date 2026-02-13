@@ -1,5 +1,8 @@
 """Main Streamlit application for Requirement Checker."""
+import hashlib
 import io
+import os
+import tempfile
 import time
 import streamlit as st
 import pandas as pd
@@ -42,6 +45,21 @@ try:
 except (ImportError, AttributeError):
     PAGEINDEX_API_KEY = ""
     PAGEINDEX_CHAT_URL = "https://api.pageindex.ai/chat/completions"
+
+# Optional file logging for local debugging: set TENDER_CHECK_DEBUG=1 or path to log file
+def _tender_check_debug_log(msg: str, exc: Exception = None):
+    path = os.environ.get("TENDER_CHECK_DEBUG", "").strip()
+    if not path:
+        return
+    if path == "1":
+        path = os.path.join(os.path.dirname(__file__), "tender_check_debug.log")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+            if exc:
+                f.write(traceback.format_exc() + "\n")
+    except Exception:
+        pass
 from tender_checker.workflow import TenderCheckWorkflow
 from clients.pageindex_client import PageIndexClient
 from tender_checker.prompts.agent_prompts import (
@@ -852,74 +870,69 @@ def show_tender_check_tab():
         st.session_state.tender_orchestrator_prompt = new_val
         del st.session_state.tender_orchestrator_prompt_to_apply
     
-    # Evidence source: RAG (Supabase chunks) or PageIndex Legacy Retrieval (no Chat API)
+    # Evidence source: RAG, PageIndex (API), or PageIndex (Our)
     st.markdown("---")
     st.subheader("📁 Project Configuration")
     evidence_source = st.radio(
         "Evidence source",
-        options=["RAG (Supabase chunks)", "PageIndex (Retrieval)"],
+        options=["RAG (Supabase chunks)", "PageIndex (API)", "PageIndex (Our)"],
         index=0,
-        help="RAG: retrieve chunks from Supabase. PageIndex: Legacy Retrieval API (submit query + poll) per requirement per doc → chunks (no Chat API).",
+        help="RAG: requirement-based check with Supabase chunks. PageIndex (API): use PageIndex Chat API for requirements and checks (costly). PageIndex (Our): same tree from PageIndex, but requirements and checks use your own LLM (e.g. GPT-4o) via tree RAG.",
         key="tender_evidence_source"
     )
-    use_pageindex_chat = evidence_source == "PageIndex (Retrieval)"
+    use_pageindex_chat = evidence_source == "PageIndex (API)"
+    use_pageindex_our = evidence_source == "PageIndex (Our)"
+    use_pageindex = use_pageindex_chat or use_pageindex_our
 
-    if use_pageindex_chat:
+    if use_pageindex:
         if not (PAGEINDEX_API_KEY or "").strip():
-            st.warning("Set **PAGEINDEX_API_KEY** in `.env` to use PageIndex Retrieval.")
+            st.warning("Set **PAGEINDEX_API_KEY** in `.env` to use PageIndex (API or Our).")
         st.markdown("**PageIndex document IDs** (from [PageIndex](https://docs.pageindex.ai/endpoints) — upload PDFs to get `doc_id`s)")
-        col1, col2 = st.columns(2)
-        with col1:
-            reference_doc_id = st.text_input(
-                "Reference doc_id (omission)",
-                value=st.session_state.get("tender_reference_doc_id", "pi-cml3ep35803gd09qzoczvn1kr"),
-                help="PageIndex doc_id for the reference document",
-                key="tender_reference_doc_id"
-            )
-        with col2:
-            guidelines_doc_id = st.text_input(
-                "Guidelines doc_id (contradiction)",
-                value=st.session_state.get("tender_guidelines_doc_id", ""),
-                help="PageIndex doc_id for guidelines. Leave empty to use the reference doc for both.",
-                key="tender_guidelines_doc_id"
-            )
-        reference_project_id = ""  # not used in PageIndex path
-        guidelines_project_id = ""
-        top_k = 5  # not used
+        submission_doc_id = st.text_input(
+            "Submission doc_id (section index)",
+            value=st.session_state.get("tender_submission_doc_id", ""),
+            help="PageIndex doc_id for the submission document. Section index is built from this tree. Leave empty to extract sections from uploaded PDF/text.",
+            key="tender_submission_doc_id"
+        )
+        reference_doc_id = st.text_input(
+            "Reference doc_id",
+            value=st.session_state.get("tender_reference_doc_id", "pi-cmlhtl65t021c0gqtjbhiuezg"),
+            help="PageIndex doc_id for the single reference document (source of requirements and for omission/contradiction checks).",
+            key="tender_reference_doc_id"
+        )
+        st.markdown("**Fallback RAG** — used when PageIndex returns no chunks for a requirement")
+        reference_project = st.selectbox(
+            "Fallback RAG project",
+            options=list(PROJECT_IDS.keys()),
+            index=2,
+            help="Supabase project for RAG fallback when PageIndex returns no chunks.",
+            key="tender_pageindex_ref_project"
+        )
+        reference_project_id = PROJECT_IDS[reference_project]
+        guidelines_project_id = reference_project_id
         max_workers = 5
     else:
-        col1, col2 = st.columns(2)
-        with col1:
-            reference_project = st.selectbox(
-                "Reference Documents Project",
-                options=list(PROJECT_IDS.keys()),
-                index=2,
-                help="Project ID for reference documents (used for omission checking)",
-                key="tender_reference_project"
-            )
-            reference_project_id = PROJECT_IDS[reference_project]
-        with col2:
-            guidelines_project = st.selectbox(
-                "Guidelines Project",
-                options=list(PROJECT_IDS.keys()),
-                index=2,
-                help="Project ID for guidelines (used for contradiction checking). If same as reference, leave as is.",
-                key="tender_guidelines_project"
-            )
-            guidelines_project_id = PROJECT_IDS[guidelines_project]
+        reference_project = st.selectbox(
+            "Reference Documents Project",
+            options=list(PROJECT_IDS.keys()),
+            index=2,
+            help="Project ID for reference documents (used for omission and contradiction checking).",
+            key="tender_reference_project"
+        )
+        reference_project_id = PROJECT_IDS[reference_project]
+        guidelines_project_id = reference_project_id
         reference_doc_id = ""
-        guidelines_doc_id = ""
+        submission_doc_id = ""
 
-    # Advanced settings (RAG only: top_k and workers; PageIndex uses same workers for Chat calls)
+    # Advanced settings: top_k (RAG and PageIndex fallback), workers
     with st.expander("⚙️ Advanced Settings", expanded=False):
         top_k = st.slider(
             "Chunks per Requirement (top_k)",
             min_value=3,
             max_value=15,
             value=5,
-            help="Number of document chunks to retrieve per requirement (RAG only)",
+            help="RAG: chunks per requirement. PageIndex: used for Supabase fallback when Tree RAG returns no chunks.",
             key="tender_top_k",
-            disabled=use_pageindex_chat
         )
         max_workers = st.slider(
             "Parallel Workers",
@@ -929,8 +942,6 @@ def show_tender_check_tab():
             help="Number of parallel workers for requirement checking",
             key="tender_max_workers"
         )
-        if use_pageindex_chat:
-            top_k = 5
     
     st.markdown("---")
     
@@ -1353,35 +1364,41 @@ def show_tender_check_tab():
         if not pdf_bytes:
             st.error("PDF file is empty.")
             return
-        use_llamaparse = bool(LLAMA_CLOUD_API_KEY and LLAMA_CLOUD_API_KEY.strip())
-        with st.spinner(
-            "Parsing PDF with LlamaParse (layout + tables)..."
-            if use_llamaparse
-            else "Extracting text from PDF..."
-        ):
-            tender_text = None
-            if use_llamaparse:
-                class _PdfBytes:
-                    read = lambda self: pdf_bytes
-                    name = getattr(uploaded_pdf, "name", "document.pdf") or "document.pdf"
-                tender_text = extract_text_from_pdf_with_llamaparse(_PdfBytes())
-                if tender_text:
-                    st.success(f"✓ LlamaParse: extracted {len(tender_text)} characters (layout-aware)")
-            if not tender_text:
-                tender_text = extract_text_from_pdf(io.BytesIO(pdf_bytes))
-                if tender_text:
-                    st.success(f"✓ Extracted {len(tender_text)} characters from PDF")
-            if not tender_text:
-                st.error("Failed to extract text from PDF. Please try again.")
-                return
 
-        # Prompt sanity checks (prevents silent empty extractions)
-        if "{{tender_text}}" not in st.session_state.tender_breakdown_prompt:
-            st.error("Breakdown prompt is missing the {{tender_text}} placeholder.")
-            st.info("Add {{tender_text}} to the Breakdown prompt so the model sees the uploaded document.")
-            return
-        if "requirements" not in st.session_state.tender_breakdown_prompt.lower():
-            st.warning("Breakdown prompt does not mention 'requirements'. This can lead to empty outputs.")
+        # When PageIndex is used, submission structure comes from PageIndex tree (upload PDF → get tree). No need to parse PDF to text.
+        if use_pageindex:
+            tender_text = ""
+        else:
+            # RAG path or PageIndex with existing submission_doc_id: need tender text for breakdown or section extraction fallback
+            use_llamaparse = bool(LLAMA_CLOUD_API_KEY and LLAMA_CLOUD_API_KEY.strip())
+            with st.spinner(
+                "Parsing PDF with LlamaParse (layout + tables)..."
+                if use_llamaparse
+                else "Extracting text from PDF..."
+            ):
+                tender_text = None
+                if use_llamaparse:
+                    class _PdfBytes:
+                        read = lambda self: pdf_bytes
+                        name = getattr(uploaded_pdf, "name", "document.pdf") or "document.pdf"
+                    tender_text = extract_text_from_pdf_with_llamaparse(_PdfBytes())
+                    if tender_text:
+                        st.success(f"✓ LlamaParse: extracted {len(tender_text)} characters (layout-aware)")
+                if not tender_text:
+                    tender_text = extract_text_from_pdf(io.BytesIO(pdf_bytes))
+                    if tender_text:
+                        st.success(f"✓ Extracted {len(tender_text)} characters from PDF")
+                if not tender_text:
+                    st.error("Failed to extract text from PDF. Please try again.")
+                    return
+
+            # Prompt sanity checks (for RAG or when tender text is used)
+            if "{{tender_text}}" not in st.session_state.tender_breakdown_prompt:
+                st.error("Breakdown prompt is missing the {{tender_text}} placeholder.")
+                st.info("Add {{tender_text}} to the Breakdown prompt so the model sees the uploaded document.")
+                return
+            if "requirements" not in st.session_state.tender_breakdown_prompt.lower():
+                st.warning("Breakdown prompt does not mention 'requirements'. This can lead to empty outputs.")
 
         # Thread-safe progress and result holders (background thread must NOT touch st.session_state)
         progress_store: Dict[str, Any] = {}
@@ -1398,7 +1415,7 @@ def show_tender_check_tab():
                 })
 
         pageindex_client = None
-        if use_pageindex_chat and (PAGEINDEX_API_KEY or "").strip():
+        if use_pageindex and (PAGEINDEX_API_KEY or "").strip():
             try:
                 pageindex_client = PageIndexClient(
                     api_key=PAGEINDEX_API_KEY.strip(),
@@ -1407,12 +1424,69 @@ def show_tender_check_tab():
             except Exception as e:
                 st.error(f"Failed to create PageIndex client: {str(e)}")
                 return
-        if use_pageindex_chat and not pageindex_client:
-            st.error("PageIndex (Retrieval) selected but PAGEINDEX_API_KEY is not set. Set it in .env or switch to RAG.")
+        if use_pageindex and not pageindex_client:
+            st.error("PageIndex (API or Our) selected but PAGEINDEX_API_KEY is not set. Set it in .env or switch to RAG.")
             return
-        if use_pageindex_chat and not (reference_doc_id or "").strip():
-            st.error("PageIndex (Retrieval) selected but Reference doc_id is empty. Enter a PageIndex doc_id.")
+        if use_pageindex and not (submission_doc_id or "").strip() and not pdf_bytes:
+            st.error("For PageIndex: upload a submission PDF (a PageIndex tree will be created from it) or provide an existing Submission doc_id.")
             return
+
+        # When PageIndex + uploaded PDF: reuse cached doc_id if same content, else create tree
+        _sub_doc_id = (submission_doc_id or "").strip() if use_pageindex else ""
+        if use_pageindex and pageindex_client and pdf_bytes:
+            try:
+                content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+                upload_filename = getattr(uploaded_pdf, "name", "document.pdf") or "document.pdf"
+                cached_doc_id = None
+                supabase = st.session_state.get("supabase_client")
+                if supabase:
+                    cached_doc_id = supabase.get_pageindex_doc_id_by_hash(content_hash)
+                if cached_doc_id:
+                    # Validate that the doc still exists and is ready in PageIndex
+                    try:
+                        if pageindex_client.is_retrieval_ready(cached_doc_id):
+                            _sub_doc_id = cached_doc_id
+                            st.info(f"Reusing existing submission (doc_id: {_sub_doc_id}) — same file was uploaded before.")
+                        else:
+                            cached_doc_id = None  # force re-upload
+                    except Exception:
+                        cached_doc_id = None  # doc may have been deleted; re-upload
+                if not _sub_doc_id:
+                    with st.spinner("Uploading submission PDF to PageIndex..."):
+                        # Prefer official SDK when available (same flow as notebook: submit_document)
+                        try:
+                            from pageindex import PageIndexClient as SDKClient
+                            sdk = SDKClient(api_key=PAGEINDEX_API_KEY.strip())
+                            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                                tmp.write(pdf_bytes)
+                                tmp_path = tmp.name
+                            try:
+                                _sub_doc_id = sdk.submit_document(tmp_path)["doc_id"]
+                            finally:
+                                try:
+                                    os.unlink(tmp_path)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            _sub_doc_id = pageindex_client.upload_doc(
+                                pdf_bytes,
+                                filename=upload_filename,
+                            )
+                    with st.spinner("Building section index (PageIndex tree); this may take a minute..."):
+                        pageindex_client.poll_until_ready(_sub_doc_id, poll_interval=5.0, max_wait=600.0)
+                    if supabase:
+                        supabase.save_pageindex_submission_cache(content_hash, _sub_doc_id, filename=upload_filename)
+                    st.success(f"Submission tree ready (doc_id: {_sub_doc_id})")
+            except Exception as e:
+                st.error(f"Failed to create PageIndex tree for submission: {e}")
+                return
+        elif use_pageindex and not _sub_doc_id:
+            st.error("No submission doc_id available. Upload a PDF or enter an existing Submission doc_id.")
+            return
+
+        # PageIndex: if Reference doc_id is empty, default it to Submission doc_id (single-doc mode).
+        if use_pageindex and not (reference_doc_id or "").strip():
+            reference_doc_id = _sub_doc_id
 
         try:
             workflow = TenderCheckWorkflow(
@@ -1433,24 +1507,26 @@ def show_tender_check_tab():
         st.session_state["tender_progress_store"] = progress_store
         st.session_state["tender_result_holder"] = result_holder
         _ref_id = reference_project_id
-        _guid_id = guidelines_project_id if (not use_pageindex_chat and guidelines_project_id != reference_project_id) else None
         _ref_doc_id = (reference_doc_id or "").strip()
-        _guid_doc_id = (guidelines_doc_id or "").strip()
 
         def run_workflow():
             try:
                 result = workflow.run(
                     tender_text=tender_text,
                     project_id=_ref_id or "n/a",
-                    guidelines_project_id=_guid_id,
+                    guidelines_project_id=_ref_id,
                     top_k=top_k,
                     use_pageindex_chat=use_pageindex_chat,
+                    use_pageindex_our=use_pageindex_our,
                     reference_doc_id=_ref_doc_id,
-                    guidelines_doc_id=_guid_doc_id,
+                    guidelines_doc_id="",
+                    submission_doc_id=_sub_doc_id,
                 )
                 result_holder["result"] = result
             except Exception as e:
                 result_holder["error"] = str(e)
+                result_holder["error_traceback"] = traceback.format_exc()
+                _tender_check_debug_log("Tender check workflow error: " + str(e), e)
             finally:
                 result_holder["done"] = True
 
@@ -1466,6 +1542,7 @@ def show_tender_check_tab():
             err = result_holder.get("error")
             if err:
                 st.session_state["tender_workflow_error_display"] = err
+                st.session_state["tender_workflow_error_traceback"] = result_holder.get("error_traceback", "")
             else:
                 st.session_state["tender_check_result"] = result_holder.get("result")
             st.session_state.pop("tender_progress_store", None)
@@ -1481,10 +1558,16 @@ def show_tender_check_tab():
 
     # Show workflow error from previous run (after rerun)
     if st.session_state.get("tender_workflow_error_display"):
-        st.error("Error during tender checking: " + st.session_state["tender_workflow_error_display"])
+        err_msg = st.session_state["tender_workflow_error_display"]
+        st.error("Error during tender checking: " + err_msg)
         with st.expander("Error Details"):
-            st.code(st.session_state["tender_workflow_error_display"])
+            st.code(err_msg)
+            tb = st.session_state.get("tender_workflow_error_traceback")
+            if tb:
+                st.text("Full traceback (where to look when testing locally):")
+                st.code(tb)
         st.session_state.pop("tender_workflow_error_display", None)
+        st.session_state.pop("tender_workflow_error_traceback", None)
 
     # Display Results
     if "tender_check_result" in st.session_state:
@@ -1510,10 +1593,11 @@ def show_tender_check_tab():
         st.markdown("### Executive Summary")
         st.info(final_report.get("summary", "No summary available"))
         
-        # Requirements Breakdown
+        # Requirements Breakdown (RAG path); PageIndex path uses submission_sections instead
         requirements = result.get("requirements", [])
+        submission_sections = result.get("submission_sections", [])
         requirements_by_id = {}
-        if not requirements:
+        if not requirements and not submission_sections and not result.get("error"):
             st.warning(
                 "No requirements were extracted. This usually means the Breakdown prompt is mis-specified. "
                 "Ensure it instructs the model to extract requirements from the uploaded tender document "
@@ -1588,9 +1672,9 @@ def show_tender_check_tab():
             
             missing = omission_summary.get("missing_requirements", [])
             if missing:
-                with st.expander("Missing Requirements", expanded=True):
-                    for req in missing:
-                        st.write(f"- {req}")
+                with st.expander("Missing requirements", expanded=True):
+                    for idx, req in enumerate(missing, 1):
+                        st.markdown(f"**{idx}.** {req}")
         
         # Contradiction Summary
         contradiction_summary = final_report.get("contradiction_summary", {})
@@ -1608,9 +1692,9 @@ def show_tender_check_tab():
             
             contradictions = contradiction_summary.get("contradictions", [])
             if contradictions:
-                with st.expander("Contradictions Found", expanded=True):
-                    for cont in contradictions:
-                        st.write(f"- {cont}")
+                with st.expander("Contradictions found", expanded=True):
+                    for idx, cont in enumerate(contradictions, 1):
+                        st.markdown(f"**{idx}.** {cont}")
         
         # Critical Issues
         critical_issues = final_report.get("critical_issues", [])
@@ -1660,82 +1744,87 @@ def show_tender_check_tab():
             if not filtered_issues:
                 st.info("No issues match the selected filters.")
             else:
-                for issue in filtered_issues:
+                for num, issue in enumerate(filtered_issues, 1):
                     severity_color = {
                         "CRITICAL": "🔴",
                         "MODERATE": "🟡",
                         "MINOR": "🟢"
                     }.get(issue.get("severity", ""), "⚪")
-
                     issue_type = issue.get("issue_type", "N/A")
                     req_id = issue.get("requirement_id", "N/A")
+                    description = issue.get("description", "") or "No description."
 
-                    st.markdown(f"{severity_color} **{req_id}** - {issue_type}")
-                    st.caption(issue.get("description", ""))
-                    st.caption(f"**Impact:** {issue.get('impact', 'N/A')}")
+                    # 1. Issue heading (clear one-line summary)
+                    st.markdown(f"### {num}. {severity_color} **{req_id}** — {issue_type}")
+                    st.markdown(f"**Summary:** {description}")
+                    st.markdown(f"**Impact:** {issue.get('impact', 'N/A')}")
 
-                    # Show the full underlying requirement text (if available)
-                    requirement = requirements_by_id.get(req_id) if requirements else None
-                    if requirement:
-                        with st.expander("View full requirement", expanded=False):
+                    # Details block (collapsible)
+                    with st.expander("View details", expanded=(num == 1)):
+                        # Full requirement text if available
+                        requirement = requirements_by_id.get(req_id) if requirements else None
+                        if requirement:
+                            st.markdown("**Reference requirement**")
                             st.write(requirement.get("requirement_text", ""))
 
-                    # Surface more granular details from omission / contradiction agents
-                    if issue_type == "OMISSION":
-                        omission = omission_by_id.get(req_id)
-                        if omission:
-                            st.markdown("**Omission details**")
-                            st.write(
-                                f"Status: {omission.get('status', 'UNKNOWN')} "
-                                f"(confidence: {omission.get('confidence', 0.0):.2f})"
-                            )
-                            missing = omission.get("missing_elements") or []
-                            if missing:
-                                st.write("Missing elements:")
-                                for item in missing:
-                                    st.write(f"- {item}")
-                            citations = omission.get("citations") or []
-                            if citations:
-                                with st.expander("Supporting citations from reference documents", expanded=False):
+                        if issue_type == "OMISSION":
+                            omission = omission_by_id.get(req_id)
+                            if omission:
+                                st.markdown("**Omission result**")
+                                st.write(
+                                    f"Status: **{omission.get('status', 'UNKNOWN')}** "
+                                    f"(confidence: {omission.get('confidence', 0.0):.2f})"
+                                )
+                                missing_el = omission.get("missing_elements") or []
+                                if missing_el:
+                                    st.markdown("Missing elements:")
+                                    for item in missing_el:
+                                        st.write(f"- {item}")
+                                citations = omission.get("citations") or []
+                                if citations:
+                                    st.markdown("Citations (submission material):")
                                     for cit in citations:
                                         doc_ref = cit.get("document_reference", "Unknown document")
                                         src = cit.get("source_text", "")
                                         st.markdown(f"- *{doc_ref}*: {src}")
 
-                    elif issue_type == "CONTRADICTION":
-                        contradiction = contradiction_by_id.get(req_id)
-                        if contradiction:
-                            st.markdown("**Contradiction details**")
-                            st.write(f"Severity: {contradiction.get('severity', 'NO_CONTRADICTION')}")
-                            details = contradiction.get("contradiction_details", "")
-                            if details:
-                                st.write(details)
-                            ref_guideline = contradiction.get("reference_guideline")
-                            if ref_guideline:
-                                st.write(f"Reference guideline: {ref_guideline}")
-                            tender_stmt = contradiction.get("tender_statement")
-                            if tender_stmt:
-                                st.write(f"Tender statement: {tender_stmt}")
-                            citations = contradiction.get("citations") or []
-                            if citations:
-                                with st.expander("Supporting citations from guidelines", expanded=False):
+                        elif issue_type == "CONTRADICTION":
+                            contradiction = contradiction_by_id.get(req_id)
+                            if contradiction:
+                                st.markdown("**Contradiction result**")
+                                st.write(f"Severity: **{contradiction.get('severity', 'NO_CONTRADICTION')}**")
+                                details = contradiction.get("contradiction_details", "")
+                                if details:
+                                    st.write(details)
+                                ref_guideline = contradiction.get("reference_guideline")
+                                if ref_guideline:
+                                    st.markdown("Reference guideline:")
+                                    st.write(ref_guideline)
+                                tender_stmt = contradiction.get("tender_statement")
+                                if tender_stmt:
+                                    st.markdown("Submission statement:")
+                                    st.write(tender_stmt)
+                                citations = contradiction.get("citations") or []
+                                if citations:
+                                    st.markdown("Citations:")
                                     for cit in citations:
                                         doc_ref = cit.get("document_reference", "Unknown document")
                                         src = cit.get("source_text", "")
                                         st.markdown(f"- *{doc_ref}*: {src}")
+
+                    st.markdown("---")
 
         # Recommendations
         recommendations = final_report.get("recommendations", [])
         if recommendations:
             st.markdown("### 💡 Recommendations")
-            for rec in recommendations:
+            for idx, rec in enumerate(recommendations, 1):
                 priority_icon = {
                     "HIGH": "🔴",
                     "MEDIUM": "🟡",
                     "LOW": "🟢"
                 }.get(rec.get("priority", ""), "⚪")
-                
-                st.markdown(f"{priority_icon} **{rec.get('requirement_id', 'N/A')}** - {rec.get('action', '')}")
+                st.markdown(f"**{idx}.** {priority_icon} **{rec.get('requirement_id', 'N/A')}** — {rec.get('action', '')}")
         
         # Risk Assessment
         risk_assessment = final_report.get("risk_assessment", "")

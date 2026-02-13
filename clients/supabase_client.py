@@ -253,3 +253,54 @@ class SupabaseClient:
             print(f"Error saving prompt: {str(e)}")
             return False
 
+    # --- PageIndex submission cache (content_hash -> doc_id to avoid re-uploading same PDF) ---
+    TABLE_PAGEINDEX_CACHE = "pageindex_submission_cache"
+
+    def get_pageindex_doc_id_by_hash(self, content_hash: str) -> Optional[str]:
+        """
+        Look up a PageIndex doc_id by SHA-256 content hash of the PDF.
+        Returns None if not found or if the cache table is not available.
+        """
+        if not (content_hash or "").strip():
+            return None
+        try:
+            response = (
+                self.client.table(self.TABLE_PAGEINDEX_CACHE)
+                .select("doc_id")
+                .eq("content_hash", content_hash.strip())
+                .limit(1)
+                .execute()
+            )
+            if response.data and len(response.data) > 0:
+                return (response.data[0].get("doc_id") or "").strip() or None
+            return None
+        except Exception:
+            return None
+
+    def save_pageindex_submission_cache(
+        self,
+        content_hash: str,
+        doc_id: str,
+        filename: Optional[str] = None,
+    ) -> bool:
+        """
+        Store content_hash -> doc_id for future reuse.
+        Uses upsert on content_hash so the same hash updates doc_id/created_at.
+        Returns True on success, False on failure (e.g. table does not exist).
+        """
+        if not (content_hash or "").strip() or not (doc_id or "").strip():
+            return False
+        try:
+            row = {
+                "content_hash": content_hash.strip(),
+                "doc_id": doc_id.strip(),
+            }
+            if filename is not None:
+                row["filename"] = (filename or "").strip() or None
+            self.client.table(self.TABLE_PAGEINDEX_CACHE).upsert(
+                row, on_conflict="content_hash"
+            ).execute()
+            return True
+        except Exception:
+            return False
+
