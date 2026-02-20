@@ -1,0 +1,9 @@
+# Default options for PDF -> tree pipeline (see page_index.page_index_main)
+model: "gpt-4o-mini"
+toc_check_page_num: 20
+max_page_num_each_node: 50
+max_token_num_each_node: 12000
+if_add_node_id: "yes"
+if_add_node_summary: "yes"
+if_add_doc_description: "no"
+if_add_node_text: "yes"

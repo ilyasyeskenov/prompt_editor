@@ -9,7 +9,7 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower() or "openai"
 
 # OpenAI Configuration (used when AI_PROVIDER=openai, and for embeddings when provider=gemini)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
 
 # Gemini Configuration (used when AI_PROVIDER=gemini for chat)

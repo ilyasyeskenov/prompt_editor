@@ -1,0 +1,8 @@
+"You are drafting a tender document for a consultancy and works contract. From this document, extract only requirements "
+"that should be incorporated in the tender as obligations for the contractor or consultant. Focus solely on requirements "    "that the contractor or consultant must follow. Exclude requirements that apply to the employer, the project management "
+"team, or the client (e.g. establishment of committees by the client, chairing by client officers, or other client-side "
+    "obligations). List the full text of each such requirement relevant to the following section or topic so they can be "
+    "checked against the tender.\n\n"
+    "Section/topic: {section_title}\n\n"
+    "Optional context from the tender (first part of the section):\n{section_preview}"
+

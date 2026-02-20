@@ -141,6 +141,50 @@ Return your analysis as JSON only:
 }
 ```"""
 
+# One LLM call per section: assess all relevant requirements and give detailed explanations for non-compliance
+SECTION_COMPLIANCE_PROMPT = """You are a Compliance Auditor. For ONE submission section, you will assess it against the reference requirements and return structured verdicts plus detailed explanations when the section is not fully compliant.
+
+**Submission section title:** {{section_title}}
+**Submission section ID:** {{section_id}}
+
+**Submission section content (the tender text for this section):**
+{{submission_section_content}}
+
+**Reference requirements / guidelines (from the reference document, relevant to this section):**
+{{reference_context}}
+
+**Your task:**
+1. Identify each distinct requirement from the reference context that applies to this section. **Only include requirements that the contractor or consultant must fulfill.** Do not list requirements that apply to the employer, the project management team, or the client (e.g. establishment of committees by the client, chairing by client officers). If the reference context contains such obligations, omit them from the requirements list.
+2. For each requirement, determine:
+   - **Omission:** Is the requirement FULFILLED, PARTIALLY_FULFILLED, or NOT_FULFILLED by the submission section? Provide a clear justification and exact citations from the submission where relevant.
+   - **Contradiction:** Does the submission contradict the reference? NO_CONTRADICTION, MINOR, MODERATE, or CRITICAL. If there is a contradiction, describe it and cite the conflicting text.
+3. **Important:** When something is NOT compliant (omission or contradiction), give a **detailed explanation** in the justification/contradiction_details so the reader understands exactly what is wrong and where. Be specific: quote clauses, state what is missing or conflicting, and why it matters.
+4. In **section_detailed_explanations**, provide a concise but informative summary of all non-compliance issues in this section. If the section is fully compliant, say so briefly. If there are gaps or contradictions, explain each one clearly so the tender author knows what to fix.
+
+Return ONLY valid JSON in this exact schema:
+
+```json
+{
+  "section_id": "{{section_id}}",
+  "section_title": "{{section_title}}",
+  "requirements": [
+    {
+      "requirement_id": "SEC-X-REQ-1",
+      "requirement_text": "The requirement statement from the reference",
+      "omission_status": "FULFILLED" | "PARTIALLY_FULFILLED" | "NOT_FULFILLED",
+      "omission_justification": "Clear explanation; cite exact submission text where relevant. For non-compliance, explain in detail what is missing.",
+      "omission_citations": [{"source_text": "Exact quote from submission", "relevance": "How it supports or fails the requirement"}],
+      "missing_elements": ["What is missing if not fully fulfilled"],
+      "contradiction_status": "NO_CONTRADICTION" | "MINOR" | "MODERATE" | "CRITICAL",
+      "contradiction_details": "Description of the contradiction and exact conflicting text, or state that no contradiction was found.",
+      "contradiction_citations": [],
+      "recommendation": "Concrete action to resolve, or 'No change required'"
+    }
+  ],
+  "section_detailed_explanations": "For this section: a clear summary of any non-compliance. List each issue with a short explanation of what is wrong and what should be changed. If fully compliant, state that briefly."
+}
+```"""
+
 ORCHESTRATOR_PROMPT = """You are a Senior Compliance Review Officer. Your task is to synthesize results from multiple compliance checks and provide a comprehensive assessment of a tender submission.
 
 **Tender Overview:**
@@ -152,11 +196,14 @@ ORCHESTRATOR_PROMPT = """You are a Senior Compliance Review Officer. Your task i
 **Contradiction Check Results:**
 {{contradiction_results}}
 
+**Section-level detailed explanations (when provided):**
+{{section_explanations}}
+
 **Instructions:**
 1. Review all omission check results in detail, paying attention to `missing_elements`, `status`, and `citations` for each requirement.
 2. Review all contradiction check results in detail, paying attention to `severity`, `contradiction_details`, `reference_guideline`, `tender_statement`, and `citations`.
 3. Assess overall compliance status.
-4. Identify critical issues that must be addressed. For each critical issue, clearly describe what is non-compliant, referencing the original requirement and the specific missing or contradicting clauses from the source documents.
+4. Identify critical issues that must be addressed. For each critical issue, clearly describe what is non-compliant, referencing the original requirement and the specific missing or contradicting clauses from the source documents. Use the section-level detailed explanations above where they provide clearer or more specific descriptions of non-compliance.
 5. Provide actionable, concrete recommendations that explain exactly what should be changed in the tender to become compliant.
 6. Generate a risk assessment that explains the practical impact of non-compliance (e.g., operational, regulatory, financial).
 

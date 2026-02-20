@@ -1,9 +1,11 @@
 """Logging utilities for the application."""
 import json
+import os
 from datetime import datetime
 from typing import Dict, Optional
 
-LOG_PATH = "/Users/ilyasyeskenov/Desktop/req_check/.cursor/debug.log"
+# Portable path: log next to the app root (works when deployed)
+LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "debug.log")
 
 
 def log(hypothesis_id: str, location: str, message: str, data: Optional[Dict] = None):

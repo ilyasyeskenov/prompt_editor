@@ -1,0 +1,4 @@
+{"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "timestamp": 1771558288844, "location": "session_state.py", "message": "Initializing SupabaseClient", "data": {}}
+{"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "timestamp": 1771558288941, "location": "session_state.py", "message": "SupabaseClient initialized successfully", "data": {}}
+{"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "timestamp": 1771558288941, "location": "session_state.py", "message": "Initializing AIClient", "data": {}}
+{"sessionId": "debug-session", "runId": "run1", "hypothesisId": "A", "timestamp": 1771558288948, "location": "session_state.py", "message": "AIClient initialized successfully", "data": {}}

@@ -3,13 +3,15 @@ import json
 import os
 import re
 import threading
+import time
 import traceback
 from typing import TypedDict, List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.graph import StateGraph, END
+
 from clients.ai_client import AIClient
 from clients.supabase_client import SupabaseClient
-from utils.pageindex_tree_rag import get_tree, flatten_tree_to_nodes, tree_rag_retrieve
+from our_pageindex import get_tree, flatten_tree_to_nodes, tree_rag_retrieve, chat as pageindex_chat
 from tender_checker.agents.breakdown_agent import BreakdownAgent
 from tender_checker.agents.omission_checker_agent import OmissionCheckerAgent
 from tender_checker.agents.contradiction_checker_agent import ContradictionCheckerAgent
@@ -17,6 +19,7 @@ from tender_checker.agents.orchestrator_agent import OrchestratorAgent
 from tender_checker.prompts.agent_prompts import (
     SECTION_EXTRACTION_PROMPT,
     REQUIREMENTS_LIST_EXTRACTION_PROMPT,
+    SECTION_COMPLIANCE_PROMPT,
 )
 
 # Batching and rate-limit defaults
@@ -49,9 +52,14 @@ PAGEINDEX_CONTRADICTION_QUESTION = (
     "Quote any conflicting parts. Answer: no contradiction / minor / moderate / critical contradiction.\n\nRequirement: {requirement_text}"
 )
 # Section-based (reference-driven) PageIndex: query to get handbook requirements relevant to a tender section
+# Emphasize contractor/consultant obligations only; exclude employer/project-management requirements
 PAGEINDEX_SECTION_REQUIREMENTS_QUERY = (
-    "List all requirements from this document that a tender must comply with, relevant to the following section or topic. "
-    "Return the full text of each requirement or guideline so they can be checked against the tender.\n\n"
+    "You are drafting a tender document for a consultancy and works contract. From this document, extract only requirements "
+    "that should be incorporated in the tender as obligations for the contractor or consultant. Focus solely on requirements "
+    "that the contractor or consultant must follow. Exclude requirements that apply to the employer, the project management "
+    "team, or the client (e.g. establishment of committees by the client, chairing by client officers, or other client-side "
+    "obligations). List the full text of each such requirement relevant to the following section or topic so they can be "
+    "checked against the tender.\n\n"
     "Section/topic: {section_title}\n\n"
     "Optional context from the tender (first part of the section):\n{section_preview}"
 )
@@ -225,6 +233,7 @@ class TenderCheckState(TypedDict):
     retrieval_results: List[Dict[str, Any]]
     omission_results: List[Dict[str, Any]]
     contradiction_results: List[Dict[str, Any]]
+    section_explanations: List[Dict[str, Any]]  # Section-level detailed explanations (section_id, section_title, detailed_explanations)
     final_report: Dict[str, Any]
     project_id: str
     guidelines_project_id: str
@@ -251,11 +260,13 @@ class TenderCheckWorkflow:
         retrieval_max_workers: int = RETRIEVAL_MAX_WORKERS,
         openai_concurrency: int = OPENAI_CONCURRENCY,
         progress_callback: Optional[Callable[[str, int, int, Dict[str, Any]], None]] = None,
-        pageindex_client: Optional[Any] = None,
+        tree_storage: Optional[Any] = None,
     ):
         self.ai_client = ai_client
         self.supabase_client = supabase_client
-        self.pageindex_client = pageindex_client
+        self.tree_storage = tree_storage
+        self._tree_cache: Dict[str, tuple] = {}  # doc_id -> (tree, timestamp) for get_tree_cached
+        self._tree_cache_ttl = 3600.0
         self.retrieval_batch_size = retrieval_batch_size
         self.retrieval_max_workers = retrieval_max_workers
         self.openai_semaphore = threading.Semaphore(openai_concurrency)
@@ -269,6 +280,20 @@ class TenderCheckWorkflow:
 
         # Build workflow
         self.workflow = self._build_workflow()
+
+    def _get_tree_cached(self, doc_id: str):
+        """Load tree for doc_id from storage, with in-memory cache (TTL 1h)."""
+        if not (doc_id or "").strip() or not self.tree_storage:
+            return None
+        now = time.time()
+        if doc_id in self._tree_cache:
+            tree, cached_at = self._tree_cache[doc_id]
+            if (now - cached_at) < self._tree_cache_ttl:
+                return tree
+        tree = get_tree(doc_id, self.tree_storage)
+        if tree is not None:
+            self._tree_cache[doc_id] = (tree, now)
+        return tree
 
     def _build_workflow(self) -> StateGraph:
         """Build the LangGraph workflow: breakdown → retrieval → check → orchestrate (single path, proper join)."""
@@ -333,14 +358,53 @@ class TenderCheckWorkflow:
         except Exception:
             return []
 
+    def _section_compliance_check(
+        self,
+        section: Dict[str, Any],
+        reference_context: str,
+    ) -> Dict[str, Any]:
+        """One LLM call per section: assess all requirements for this section and return structured verdicts + detailed explanations."""
+        section_id = (section.get("section_id") or "").strip() or "SEC-0"
+        section_title = (section.get("title") or "").strip() or "Section"
+        submission_content = (section.get("content") or "").strip()[:12000]
+        if len((section.get("content") or "")) > 12000:
+            submission_content += "\n..."
+        prompt = (
+            SECTION_COMPLIANCE_PROMPT.replace("{{section_id}}", section_id)
+            .replace("{{section_title}}", section_title)
+            .replace("{{submission_section_content}}", submission_content)
+            .replace("{{reference_context}}", (reference_context or "")[:15000])
+        )
+        try:
+            resp = self.ai_client.client.chat.completions.create(
+                model=self.ai_client.model,
+                messages=[
+                    {"role": "system", "content": "You are a Compliance Auditor. Return only valid JSON matching the requested schema."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            data = json.loads(raw)
+            requirements = data.get("requirements") or []
+            section_detailed_explanations = (data.get("section_detailed_explanations") or "").strip()
+            return {"requirements": requirements, "section_detailed_explanations": section_detailed_explanations}
+        except Exception as e:
+            _debug_log(f"Section compliance check failed: section_id={section_id}, error={e}", e)
+            return {"requirements": [], "section_detailed_explanations": f"Error assessing section: {e}"}
+
     def _pageindex_chat_requirements_for_section(
         self,
         doc_id: str,
         section_title: str,
         section_text: str,
     ) -> List[str]:
-        """Use PageIndex Chat API to extract requirements relevant to a section/topic."""
-        if not (self.pageindex_client and doc_id):
+        """Use pageindex module chat to extract requirements relevant to a section/topic."""
+        if not (self.tree_storage and doc_id):
+            return []
+        tree = get_tree(doc_id, self.tree_storage)
+        if not tree:
             return []
         excerpt = (section_text or "").strip()
         excerpt = excerpt[:3000] + ("..." if len(excerpt) > 3000 else "")
@@ -349,7 +413,7 @@ class TenderCheckWorkflow:
             section_preview=excerpt or "(empty)",
         )
         try:
-            content = self.pageindex_client.chat(doc_id=doc_id, message=q, enable_citations=False)
+            content = pageindex_chat(self.ai_client, q, tree)
             data = _extract_first_json_object(content) or {}
             return _get_requirements_list(data)
         except Exception:
@@ -363,7 +427,13 @@ class TenderCheckWorkflow:
         section_title: str,
         section_text: str,
     ) -> Dict[str, Any]:
-        """Use PageIndex Chat API to produce both omission + contradiction JSON for one requirement."""
+        """Use pageindex module chat to produce both omission + contradiction JSON for one requirement."""
+        tree = get_tree(doc_id, self.tree_storage) if self.tree_storage else None
+        if not tree:
+            return {
+                "omission": {"requirement_id": requirement_id, "status": "ERROR", "confidence": 0.0, "justification": "No tree for doc_id", "citations": []},
+                "contradiction": {"requirement_id": requirement_id, "has_contradiction": False, "severity": "NO_CONTRADICTION", "contradiction_details": "", "citations": []},
+            }
         excerpt = (section_text or "").strip()
         excerpt = excerpt[:8000] + ("..." if len(excerpt) > 8000 else "")
         q = PAGEINDEX_CHAT_COMBINED_CHECK_QUERY.format(
@@ -373,7 +443,7 @@ class TenderCheckWorkflow:
             section_excerpt=excerpt or "(empty)",
         )
         try:
-            content = self.pageindex_client.chat(doc_id=doc_id, message=q, enable_citations=False)
+            content = pageindex_chat(self.ai_client, q, tree)
             data = _extract_first_json_object(content) or {}
             omission = _get_nested_dict(data, "omission")
             contradiction = _get_nested_dict(data, "contradiction")
@@ -409,13 +479,15 @@ class TenderCheckWorkflow:
         submission_doc_id = (state.get("submission_doc_id") or "").strip()
         tender_text = state.get("tender_text") or ""
         try:
-            if use_pageindex and self.pageindex_client and submission_doc_id:
+            if use_pageindex and self.tree_storage and submission_doc_id:
                 if self.progress_callback:
-                    self.progress_callback("breakdown", 1, 4, {"step": "Building submission section index (PageIndex)..."})
+                    self.progress_callback("breakdown", 1, 4, {"step": "Loading submission section index..."})
                 try:
-                    tree = get_tree(self.pageindex_client, submission_doc_id, retry_if_not_ready=True, max_retries=8)
+                    tree = get_tree(submission_doc_id, self.tree_storage)
+                    if not tree:
+                        raise ValueError("No tree found for submission doc_id. Build the tree first (upload PDF).")
                 except Exception as e:
-                    error_msg = f"Failed to get submission tree from PageIndex: {e}"
+                    error_msg = f"Failed to load submission tree: {e}"
                     if self.progress_callback:
                         self.progress_callback("breakdown", 1, 4, {"step": "Breakdown error", "error": error_msg})
                     return {
@@ -438,7 +510,7 @@ class TenderCheckWorkflow:
                         "error": error_msg,
                     }
                 tender_summary = (
-                    f"Submission with {len(submission_sections)} sections (section index from PageIndex)."
+                    f"Submission with {len(submission_sections)} sections (section index from document tree)."
                 )
                 if self.progress_callback:
                     self.progress_callback("breakdown", 1, 4, {
@@ -545,33 +617,66 @@ class TenderCheckWorkflow:
         contradiction_q = PAGEINDEX_CONTRADICTION_QUESTION.format(requirement_text=req_text)
         omission_chunks = []
         contradiction_chunks = []
+        ref_tree = get_tree(reference_doc_id, self.tree_storage) if self.tree_storage else None
+        con_tree = get_tree(guidelines_doc_id or reference_doc_id, self.tree_storage) if self.tree_storage else None
         try:
-            context = tree_rag_retrieve(
-                self.pageindex_client,
-                self.ai_client,
-                reference_doc_id,
-                omission_q,
-            )
-            if context:
-                omission_chunks = [{"content": context, "file_name": "PageIndex Reference", "page_number": None}]
+            if ref_tree:
+                context = tree_rag_retrieve(self.ai_client, omission_q, ref_tree)
+                if context:
+                    omission_chunks = [{"content": context, "file_name": "Reference", "page_number": None}]
         except Exception:
             omission_chunks = []
         try:
-            con_doc_id = guidelines_doc_id or reference_doc_id
-            context = tree_rag_retrieve(
-                self.pageindex_client,
-                self.ai_client,
-                con_doc_id,
-                contradiction_q,
-            )
-            if context:
-                contradiction_chunks = [{"content": context, "file_name": "PageIndex Guidelines", "page_number": None}]
+            if con_tree:
+                context = tree_rag_retrieve(self.ai_client, contradiction_q, con_tree)
+                if context:
+                    contradiction_chunks = [{"content": context, "file_name": "Guidelines", "page_number": None}]
         except Exception:
             contradiction_chunks = []
         return {
             "requirement": requirement,
             "omission_chunks": omission_chunks,
             "contradiction_chunks": contradiction_chunks,
+        }
+
+    def _process_one_section_retrieval(
+        self,
+        section: Dict[str, Any],
+        index: int,
+        total: int,
+        ref_tree: List[Dict[str, Any]],
+        reference_doc_id: str,
+    ) -> Dict[str, Any]:
+        """Process a single submission section: tree_rag_retrieve with shared ref_tree. Returns one section-level item for the section-compliance path (one LLM call per section)."""
+        section_id = section.get("section_id") or section.get("node_id") or f"SEC-{index+1}"
+        title = section.get("title", "") or f"Section {index+1}"
+        sentence_text = (section.get("content", "") or "").strip()
+        section_preview = (sentence_text[:2000] + "..." if len(sentence_text) > 2000 else sentence_text)
+        query = PAGEINDEX_SECTION_REQUIREMENTS_QUERY.format(
+            section_title=title,
+            section_preview=section_preview,
+        )
+        reference_requirements_context = ""
+        try:
+            if ref_tree:
+                reference_requirements_context = tree_rag_retrieve(
+                    self.ai_client,
+                    query,
+                    ref_tree,
+                )
+        except Exception:
+            pass
+        # One row per section for section-compliance mode: check node will do one LLM call per section with (section content + reference context)
+        return {
+            "section_compliance_mode": True,
+            "section": {
+                "section_id": section_id,
+                "title": title,
+                "content": sentence_text,
+            },
+            "reference_context": reference_requirements_context or "(No reference requirements retrieved for this section.)",
+            "omission_chunks": [{"content": sentence_text, "file_name": f"Submission: {title}", "page_number": None}],
+            "contradiction_chunks": [{"content": reference_requirements_context or "(No reference requirements retrieved)", "file_name": f"Reference: {title}", "page_number": None}],
         }
 
     def _retrieval_node_section_based(
@@ -581,65 +686,52 @@ class TenderCheckWorkflow:
         reference_doc_id: str,
         guidelines_doc_id: str,
     ) -> Dict[str, Any]:
-        """Submission section by section: for each section get Sentence Text (submission) and Requirement Text (reference); omission + contradiction."""
-        results: List[Dict[str, Any]] = []
+        """Submission section by section: for each section get Sentence Text (submission) and Requirement Text (reference); omission + contradiction.
+        Fetches reference tree once (cached across runs via get_tree_cached) and processes sections in parallel.
+        """
         total = len(submission_sections)
-        for i, section in enumerate(submission_sections):
-            if self.progress_callback:
-                self.progress_callback("retrieval", 2, 4, {
-                    "step": "PageIndex (Our): section-by-section",
-                    "total_requirements": total,
-                    "completed": i,
-                    "current_section": section.get("title", ""),
-                })
-            section_id = section.get("section_id") or section.get("node_id") or f"SEC-{i+1}"
-            title = section.get("title", "") or f"Section {i+1}"
-            sentence_text = (section.get("content", "") or "").strip()
-            section_preview = (sentence_text[:2000] + "..." if len(sentence_text) > 2000 else sentence_text)
-            query = PAGEINDEX_SECTION_REQUIREMENTS_QUERY.format(
-                section_title=title,
-                section_preview=section_preview,
-            )
-            reference_requirements_context = ""
-            try:
-                reference_requirements_context = tree_rag_retrieve(
-                    self.pageindex_client,
-                    self.ai_client,
-                    reference_doc_id,
-                    query,
-                )
-            except Exception:
-                pass
-            reference_requirement_strings = self._parse_requirements_from_text(reference_requirements_context) if reference_requirements_context else []
-            if not reference_requirement_strings and reference_requirements_context:
-                reference_requirement_strings = [reference_requirements_context]
-            # Omission: for each reference requirement, check for supporting evidence in submission section (sentence text)
-            for j, reference_requirement_text in enumerate(reference_requirement_strings):
-                req_id = f"SEC-{section_id}-OM-{j+1}"
-                results.append({
-                    "requirement": {
-                        "id": req_id,
-                        "requirement_text": reference_requirement_text,
-                        "reference_requirement_text": reference_requirement_text,
-                        "submission_section_content": sentence_text,
-                        "section_title": title,
-                        "section_id": section_id,
-                    },
-                    "omission_chunks": [{"content": sentence_text, "file_name": f"Submission: {title}", "page_number": None}],
-                    "contradiction_chunks": [],
-                })
-            # Contradiction: for each submission section (sentence text), check compliance with reference requirements
-            results.append({
-                "requirement": {
-                    "id": f"SEC-{section_id}-CON",
-                    "requirement_text": sentence_text[:12000] + ("..." if len(sentence_text) > 12000 else ""),
-                    "submission_section_content": sentence_text[:12000] + ("..." if len(sentence_text) > 12000 else ""),
-                    "section_title": title,
-                    "section_id": section_id,
-                },
-                "omission_chunks": [],
-                "contradiction_chunks": [{"content": reference_requirements_context or "(No reference requirements retrieved)", "file_name": f"Reference: {title}", "page_number": None}],
+        if self.progress_callback:
+            self.progress_callback("retrieval", 2, 4, {
+                "step": "PageIndex (Our): fetching reference tree...",
+                "total_requirements": total,
+                "completed": 0,
             })
+        ref_tree = self._get_tree_cached(reference_doc_id)
+        if not ref_tree:
+            if self.progress_callback:
+                self.progress_callback("retrieval", 2, 4, {"step": "Reference tree not found.", "error": "No tree for reference_doc_id"})
+            return {"retrieval_results": []}
+        if self.progress_callback:
+            self.progress_callback("retrieval", 2, 4, {
+                "step": "PageIndex (Our): section-by-section (parallel)",
+                "total_requirements": total,
+                "completed": 0,
+            })
+        max_workers = min(6, max(1, total))
+        completed = 0
+        results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._process_one_section_retrieval,
+                    section,
+                    i,
+                    total,
+                    ref_tree,
+                    reference_doc_id,
+                )
+                for i, section in enumerate(submission_sections)
+            ]
+            for fut in futures:
+                section_item = fut.result()
+                results.append(section_item)
+                completed += 1
+                if self.progress_callback:
+                    self.progress_callback("retrieval", 2, 4, {
+                        "step": "PageIndex (Our): section-by-section (parallel)",
+                        "total_requirements": total,
+                        "completed": completed,
+                    })
         # Fallback: fill empty chunks from Supabase when possible
         project_id = (state.get("project_id") or "").strip()
         guidelines_id = (state.get("guidelines_project_id") or "").strip()
@@ -674,8 +766,8 @@ class TenderCheckWorkflow:
         """Retrieval: submission section-by-section (PageIndex API or Our), or requirement-based (RAG), or Supabase RAG."""
         requirements = state.get("requirements", [])
         submission_sections = state.get("submission_sections", []) or state.get("sections", [])
-        use_pageindex_chat = state.get("use_pageindex_chat", False) and self.pageindex_client
-        use_pageindex_our = state.get("use_pageindex_our", False) and self.pageindex_client
+        use_pageindex_chat = state.get("use_pageindex_chat", False) and self.tree_storage
+        use_pageindex_our = state.get("use_pageindex_our", False) and self.tree_storage
         use_pageindex = use_pageindex_chat or use_pageindex_our
         reference_doc_id = (state.get("reference_doc_id") or "").strip()
         guidelines_doc_id = (state.get("guidelines_doc_id") or "").strip()
@@ -876,7 +968,7 @@ class TenderCheckWorkflow:
             return {"omission_results": [], "contradiction_results": []}
 
         # PageIndex Chat-only path: retrieval already contains combined omission+contradiction JSON.
-        if (state.get("use_pageindex_chat", False) and self.pageindex_client
+        if (state.get("use_pageindex_chat", False) and self.tree_storage
             and retrieval_results and isinstance(retrieval_results[0], dict)
             and retrieval_results[0].get("pageindex_combined") is not None):
             omission_results: List[Dict[str, Any]] = []
@@ -886,6 +978,63 @@ class TenderCheckWorkflow:
                 omission_results.append(combined.get("omission") or {})
                 contradiction_results.append(combined.get("contradiction") or {})
             return {"omission_results": omission_results, "contradiction_results": contradiction_results}
+
+        # Section-compliance path (PageIndex Our): one LLM call per section; returns structured verdicts + detailed explanations
+        if (retrieval_results and isinstance(retrieval_results[0], dict)
+            and retrieval_results[0].get("section_compliance_mode")):
+            omission_results = []
+            contradiction_results = []
+            section_explanations: List[Dict[str, Any]] = []
+            total = len(retrieval_results)
+            for idx, item in enumerate(retrieval_results):
+                if self.progress_callback:
+                    self.progress_callback("check", 3, 4, {
+                        "step": "Section compliance check",
+                        "total_requirements": total,
+                        "completed": idx,
+                        "current_section": item.get("section", {}).get("title", ""),
+                    })
+                sec = item.get("section", {})
+                ref_ctx = item.get("reference_context", "")
+                out = self._section_compliance_check(sec, ref_ctx)
+                reqs = out.get("requirements") or []
+                section_detailed = out.get("section_detailed_explanations") or ""
+                section_explanations.append({
+                    "section_id": sec.get("section_id", ""),
+                    "section_title": sec.get("title", ""),
+                    "detailed_explanations": section_detailed,
+                })
+                for r in reqs:
+                    req_id = r.get("requirement_id") or ""
+                    omission_results.append({
+                        "requirement_id": req_id,
+                        "status": (r.get("omission_status") or "NOT_FULFILLED").replace(" ", "_"),
+                        "confidence": 0.9 if (r.get("omission_status") or "").upper() == "FULFILLED" else 0.5,
+                        "justification": r.get("omission_justification") or "",
+                        "citations": r.get("omission_citations") or [],
+                        "missing_elements": r.get("missing_elements") or [],
+                    })
+                    contradiction_results.append({
+                        "requirement_id": req_id,
+                        "has_contradiction": (r.get("contradiction_status") or "NO_CONTRADICTION") != "NO_CONTRADICTION",
+                        "severity": (r.get("contradiction_status") or "NO_CONTRADICTION").replace(" ", "_"),
+                        "contradiction_details": r.get("contradiction_details") or "",
+                        "reference_guideline": "",
+                        "tender_statement": "",
+                        "citations": r.get("contradiction_citations") or [],
+                        "recommendation": r.get("recommendation") or "",
+                    })
+            if self.progress_callback:
+                self.progress_callback("check", 3, 4, {
+                    "step": "Section compliance check complete",
+                    "total_requirements": total,
+                    "completed": total,
+                })
+            return {
+                "omission_results": omission_results,
+                "contradiction_results": contradiction_results,
+                "section_explanations": section_explanations,
+            }
 
         if self.progress_callback:
             self.progress_callback("check", 3, 4, {
@@ -1033,10 +1182,12 @@ class TenderCheckWorkflow:
                         "error": error_msg,
                     }
 
+            section_explanations = state.get("section_explanations") or []
             final_report = self.orchestrator.synthesize_results(
                 tender_summary=state.get("tender_summary", ""),
                 omission_results=omission_results or [],
                 contradiction_results=contradiction_results or [],
+                section_explanations=section_explanations,
             )
             
             # Normalize final report schema
@@ -1102,6 +1253,7 @@ class TenderCheckWorkflow:
             "retrieval_results": [],
             "omission_results": [],
             "contradiction_results": [],
+            "section_explanations": [],
             "final_report": {},
             "project_id": project_id,
             "guidelines_project_id": guidelines_project_id or project_id,

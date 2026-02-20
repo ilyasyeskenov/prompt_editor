@@ -1,6 +1,6 @@
 """Orchestrator agent - synthesizes results from all checkers."""
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from clients.ai_client import AIClient
 from tender_checker.prompts.agent_prompts import ORCHESTRATOR_PROMPT
 
@@ -16,7 +16,8 @@ class OrchestratorAgent:
         self,
         tender_summary: str,
         omission_results: List[Dict[str, Any]],
-        contradiction_results: List[Dict[str, Any]]
+        contradiction_results: List[Dict[str, Any]],
+        section_explanations: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Synthesize results from all checkers into final report.
@@ -25,6 +26,7 @@ class OrchestratorAgent:
             tender_summary: Brief summary of the tender submission
             omission_results: List of omission check results
             contradiction_results: List of contradiction check results
+            section_explanations: Optional list of {section_id, section_title, detailed_explanations} for section-level non-compliance details
             
         Returns:
             Final compliance assessment report
@@ -32,11 +34,19 @@ class OrchestratorAgent:
         # Format results for prompt
         omission_json = json.dumps(omission_results, indent=2)
         contradiction_json = json.dumps(contradiction_results, indent=2)
+        if section_explanations:
+            section_explanations_text = "\n\n".join(
+                f"**{s.get('section_title', '')}** ({s.get('section_id', '')}):\n{s.get('detailed_explanations', '')}"
+                for s in section_explanations
+            )
+        else:
+            section_explanations_text = "None provided."
         
         # Format prompt
         prompt = self.prompt_template.replace("{{tender_summary}}", tender_summary)
         prompt = prompt.replace("{{omission_results}}", omission_json)
         prompt = prompt.replace("{{contradiction_results}}", contradiction_json)
+        prompt = prompt.replace("{{section_explanations}}", section_explanations_text)
         
         try:
             response = self.ai_client.client.chat.completions.create(

@@ -1,0 +1,54 @@
+[
+  {
+    "total_page_number": 1
+  },
+  {
+    "total_token": 1080
+  },
+  {
+    "toc_content": null,
+    "toc_page_list": [],
+    "page_index_given_in_toc": "no"
+  },
+  {
+    "message": "len(group_texts): 1"
+  },
+  {
+    "message": "generate_toc: [{'structure': '12', 'title': \"Under Clause 25(iv) of the General Conditions of Employment as amended by sub-clause (A)(iv) of Clause SCE7 of the Special Conditions of Employment, the Consultants shall report all delays to the DR within 14 days of the delay being identified. The DR shall provide the Employer's view to the Consultants within 28 days of receipt of the Consultants' assessment of extension of time.\", 'physical_index': '<physical_index_1>'}, {'structure': '13', 'title': 'Resident Site Staff', 'physical_index': '<physical_index_1>'}, {'structure': '13.1', 'title': 'The establishment, duties, appointment, direct employment or deployment, remuneration, conditions of employment and administration of Resident Site Staff (RSS) shall be in accordance with the Special Conditions of Employment, including the related Appendices and the part of Schedule of Fees relating to RSS and the Schedule of Resident Site Staff Standards and Duties.', 'physical_index': '<physical_index_1>'}, {'structure': '13.2', 'title': 'RSS are engaged to supervise the works on site comprising watching, inspecting and measuring works, maintaining records and providing information to the Engineer and the DR for the preparation of interim and final certificates, settlement of Contractors\u2019 claims and preparation of as-constructed drawings. The RSS shall be responsible for ensuring that the contractors\u2019 temporary works are carried out in a safe and timely manner, and in compliance with the contract. RSS will carry out the instructions of the Consultants for the execution of the duties under the terms of the contracts and as delegated in writing by the Engineer for the contracts.', 'physical_index': '<physical_index_1>'}, {'structure': '13.3', 'title': 'The Consultants shall submit to the DR for approval the proposed RSS establishment and RSS Manual prior to commencing the recruitment process. The Consultants shall also submit reports on RSS organisation at half-yearly intervals with reference to its structure, establishment and strength as well as staff cost projection.', 'physical_index': '<physical_index_1>'}, {'structure': '13.4', 'title': 'For the employment of the Labour Relation Officer (LRO), the Consultants shall, within 14 days of commencement of the Contract, or as the case may be, within 14 days after being notified by the DR of his disapproval of employment of any person as LRO, submit the name and particulars of the person they intend to employ as the LRO to the DR for his approval. The Consultants shall furnish further information within 7 days pertinent to the employment of such person if required by the DR.', 'physical_index': '<physical_index_1>'}, {'structure': '13.5', 'title': 'The RSS shall provide assistance and facilities for Contract Advisers, Construction Quality Audit Team and also the staff of Audit Commission and the ISO 9001 and 14001 certification bodies in performing their duties in respect of auditing. The RSS shall also carry out the environmental audit, prepare and submit the audit reports, and carry out all required follow up actions for the works contracts pursuant to the EMS requirements of EMSD.', 'physical_index': '<physical_index_1>'}, {'structure': '13.6', 'title': 'The Consultants shall be provided with free uniform for the RSS under the works contracts. The Consultants shall ensure that RSS, except those who are not involved in', 'physical_index': '<physical_index_1>'}]"
+  },
+  {
+    "message": "convert_physical_index_to_int: [{'structure': '12', 'title': \"Under Clause 25(iv) of the General Conditions of Employment as amended by sub-clause (A)(iv) of Clause SCE7 of the Special Conditions of Employment, the Consultants shall report all delays to the DR within 14 days of the delay being identified. The DR shall provide the Employer's view to the Consultants within 28 days of receipt of the Consultants' assessment of extension of time.\", 'physical_index': 1}, {'structure': '13', 'title': 'Resident Site Staff', 'physical_index': 1}, {'structure': '13.1', 'title': 'The establishment, duties, appointment, direct employment or deployment, remuneration, conditions of employment and administration of Resident Site Staff (RSS) shall be in accordance with the Special Conditions of Employment, including the related Appendices and the part of Schedule of Fees relating to RSS and the Schedule of Resident Site Staff Standards and Duties.', 'physical_index': 1}, {'structure': '13.2', 'title': 'RSS are engaged to supervise the works on site comprising watching, inspecting and measuring works, maintaining records and providing information to the Engineer and the DR for the preparation of interim and final certificates, settlement of Contractors\u2019 claims and preparation of as-constructed drawings. The RSS shall be responsible for ensuring that the contractors\u2019 temporary works are carried out in a safe and timely manner, and in compliance with the contract. RSS will carry out the instructions of the Consultants for the execution of the duties under the terms of the contracts and as delegated in writing by the Engineer for the contracts.', 'physical_index': 1}, {'structure': '13.3', 'title': 'The Consultants shall submit to the DR for approval the proposed RSS establishment and RSS Manual prior to commencing the recruitment process. The Consultants shall also submit reports on RSS organisation at half-yearly intervals with reference to its structure, establishment and strength as well as staff cost projection.', 'physical_index': 1}, {'structure': '13.4', 'title': 'For the employment of the Labour Relation Officer (LRO), the Consultants shall, within 14 days of commencement of the Contract, or as the case may be, within 14 days after being notified by the DR of his disapproval of employment of any person as LRO, submit the name and particulars of the person they intend to employ as the LRO to the DR for his approval. The Consultants shall furnish further information within 7 days pertinent to the employment of such person if required by the DR.', 'physical_index': 1}, {'structure': '13.5', 'title': 'The RSS shall provide assistance and facilities for Contract Advisers, Construction Quality Audit Team and also the staff of Audit Commission and the ISO 9001 and 14001 certification bodies in performing their duties in respect of auditing. The RSS shall also carry out the environmental audit, prepare and submit the audit reports, and carry out all required follow up actions for the works contracts pursuant to the EMS requirements of EMSD.', 'physical_index': 1}, {'structure': '13.6', 'title': 'The Consultants shall be provided with free uniform for the RSS under the works contracts. The Consultants shall ensure that RSS, except those who are not involved in', 'physical_index': 1}]"
+  },
+  {
+    "mode": "process_toc_with_page_numbers",
+    "accuracy": 1.0,
+    "incorrect_results": []
+  },
+  {
+    "message": "Checking title appearance in start concurrently"
+  },
+  {
+    "message": "Response: {'thinking': \"The section title appears after the page number '12.6', indicating that there is content before the section title. Therefore, the section does not start at the beginning of the given page_text.\", 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': 'The section title appears in the page_text, but it is not the first content. There is preceding content before the section title, indicating that it does not start at the beginning of the page_text.', 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': \"The section title 'Resident Site Staff' appears after several other contents, specifically after sections 12.6 and 12.7. Therefore, it does not start at the beginning of the given page_text.\", 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': \"The section title 'RSS are engaged to supervise the works on site...' appears after the previous content discussing the General Conditions of Employment and the duties of the Consultants. Therefore, it does not start at the beginning of the given page_text.\", 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': 'The section title appears in the page_text, but it is not the first content. The page_text starts with a reference to Clause 25(iv) and other content before the section title, indicating that the section does not start at the beginning of the page_text.', 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': \"The section title 'For the employment of the Labour Relation Officer (LRO)' appears as the first content in the page_text, specifically starting at section 13.4. However, there is preceding content before this section, indicating that it does not start at the beginning of the page_text.\", 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': \"The section title 'The Consultants shall be provided with free uniform for the RSS under the works contracts. The Consultants shall ensure that RSS, except those who are not involved in.' appears after several other contents in the page_text, specifically after sections 12.6, 12.7, and 13. Therefore, it does not start at the beginning of the given page_text.\", 'start_begin': 'no'}"
+  },
+  {
+    "message": "Response: {'thinking': \"The section title 'The establishment, duties, appointment, direct employment or deployment, remuneration, conditions of employment and administration of Resident Site Staff (RSS) shall be in accordance with the Special Conditions of Employment, including the related Appendices and the part of Schedule of Fees relating to RSS and the Schedule of Resident Site Staff Standards and Duties.' does not appear at the beginning of the page_text. Instead, the page_text starts with '12.6 Under Clause 25(iv) of the General Conditions of Employment...' which indicates that there is content before the section title.\", 'start_begin': 'no'}"
+  }
+]

@@ -61,7 +61,13 @@ def _tender_check_debug_log(msg: str, exc: Exception = None):
     except Exception:
         pass
 from tender_checker.workflow import TenderCheckWorkflow
-from clients.pageindex_client import PageIndexClient
+from our_pageindex import (
+    build_tree_from_pdf,
+    build_tree_with_generated_id,
+    get_tree,
+    SupabaseTreeStorage,
+    InMemoryTreeStorage,
+)
 from tender_checker.prompts.agent_prompts import (
     BREAKDOWN_AGENT_PROMPT,
     OMISSION_CHECKER_PROMPT,
@@ -870,36 +876,32 @@ def show_tender_check_tab():
         st.session_state.tender_orchestrator_prompt = new_val
         del st.session_state.tender_orchestrator_prompt_to_apply
     
-    # Evidence source: RAG, PageIndex (API), or PageIndex (Our)
+    # Evidence source: RAG or PageIndex (Our pipeline)
     st.markdown("---")
     st.subheader("📁 Project Configuration")
     evidence_source = st.radio(
         "Evidence source",
-        options=["RAG (Supabase chunks)", "PageIndex (API)", "PageIndex (Our)"],
+        options=["RAG (Supabase chunks)", "PageIndex (Our)"],
         index=0,
-        help="RAG: requirement-based check with Supabase chunks. PageIndex (API): use PageIndex Chat API for requirements and checks (costly). PageIndex (Our): same tree from PageIndex, but requirements and checks use your own LLM (e.g. GPT-4o) via tree RAG.",
+        help="RAG: requirement-based check with Supabase chunks. PageIndex (Our): tree from PageIndex, requirements and checks use your own LLM (e.g. GPT-4o) via tree RAG.",
         key="tender_evidence_source"
     )
-    use_pageindex_chat = evidence_source == "PageIndex (API)"
+    use_pageindex_chat = False  # API option removed; only our pipeline is used
     use_pageindex_our = evidence_source == "PageIndex (Our)"
-    use_pageindex = use_pageindex_chat or use_pageindex_our
+    use_pageindex = use_pageindex_our
 
     if use_pageindex:
-        if not (PAGEINDEX_API_KEY or "").strip():
-            st.warning("Set **PAGEINDEX_API_KEY** in `.env` to use PageIndex (API or Our).")
-        st.markdown("**PageIndex document IDs** (from [PageIndex](https://docs.pageindex.ai/endpoints) — upload PDFs to get `doc_id`s)")
-        submission_doc_id = st.text_input(
-            "Submission doc_id (section index)",
-            value=st.session_state.get("tender_submission_doc_id", ""),
-            help="PageIndex doc_id for the submission document. Section index is built from this tree. Leave empty to extract sections from uploaded PDF/text.",
-            key="tender_submission_doc_id"
-        )
-        reference_doc_id = st.text_input(
-            "Reference doc_id",
-            value=st.session_state.get("tender_reference_doc_id", "pi-cmlhtl65t021c0gqtjbhiuezg"),
-            help="PageIndex doc_id for the single reference document (source of requirements and for omission/contradiction checks).",
+        st.markdown("**Document trees** — build trees from uploaded PDFs (stored in Supabase or in memory). Upload a submission PDF below; the reference document is fixed.")
+        submission_doc_id = ""  # Submission comes only from upload, not from manual doc_id
+        REFERENCE_CHOICES = {"Tender Handbook": "my-doc-001"}
+        selected_ref = st.selectbox(
+            "Reference document",
+            options=list(REFERENCE_CHOICES.keys()),
+            index=0,
+            help="Reference document used as source of requirements (Tender Handbook).",
             key="tender_reference_doc_id"
         )
+        reference_doc_id = REFERENCE_CHOICES[selected_ref]
         st.markdown("**Fallback RAG** — used when PageIndex returns no chunks for a requirement")
         reference_project = st.selectbox(
             "Fallback RAG project",
@@ -1414,74 +1416,48 @@ def show_tender_check_tab():
                     "details": details,
                 })
 
-        pageindex_client = None
-        if use_pageindex and (PAGEINDEX_API_KEY or "").strip():
+        # Tree storage for our_pageindex module (Supabase or in-memory)
+        tree_storage = None
+        if use_pageindex:
             try:
-                pageindex_client = PageIndexClient(
-                    api_key=PAGEINDEX_API_KEY.strip(),
-                    chat_url=PAGEINDEX_CHAT_URL or "https://api.pageindex.ai/chat/completions",
-                )
+                if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_ANON_KEY"):
+                    tree_storage = SupabaseTreeStorage()
+                else:
+                    tree_storage = InMemoryTreeStorage()
             except Exception as e:
-                st.error(f"Failed to create PageIndex client: {str(e)}")
+                st.error(f"Failed to create tree storage: {str(e)}")
                 return
-        if use_pageindex and not pageindex_client:
-            st.error("PageIndex (API or Our) selected but PAGEINDEX_API_KEY is not set. Set it in .env or switch to RAG.")
-            return
-        if use_pageindex and not (submission_doc_id or "").strip() and not pdf_bytes:
-            st.error("For PageIndex: upload a submission PDF (a PageIndex tree will be created from it) or provide an existing Submission doc_id.")
+        if use_pageindex and not pdf_bytes:
+            st.error("For PageIndex: upload a submission PDF (a tree will be built from it).")
             return
 
-        # When PageIndex + uploaded PDF: reuse cached doc_id if same content, else create tree
         _sub_doc_id = (submission_doc_id or "").strip() if use_pageindex else ""
-        if use_pageindex and pageindex_client and pdf_bytes:
+        if use_pageindex and tree_storage and pdf_bytes:
             try:
                 content_hash = hashlib.sha256(pdf_bytes).hexdigest()
                 upload_filename = getattr(uploaded_pdf, "name", "document.pdf") or "document.pdf"
-                cached_doc_id = None
                 supabase = st.session_state.get("supabase_client")
-                if supabase:
-                    cached_doc_id = supabase.get_pageindex_doc_id_by_hash(content_hash)
-                if cached_doc_id:
-                    # Validate that the doc still exists and is ready in PageIndex
-                    try:
-                        if pageindex_client.is_retrieval_ready(cached_doc_id):
-                            _sub_doc_id = cached_doc_id
-                            st.info(f"Reusing existing submission (doc_id: {_sub_doc_id}) — same file was uploaded before.")
-                        else:
-                            cached_doc_id = None  # force re-upload
-                    except Exception:
-                        cached_doc_id = None  # doc may have been deleted; re-upload
-                if not _sub_doc_id:
-                    with st.spinner("Uploading submission PDF to PageIndex..."):
-                        # Prefer official SDK when available (same flow as notebook: submit_document)
-                        try:
-                            from pageindex import PageIndexClient as SDKClient
-                            sdk = SDKClient(api_key=PAGEINDEX_API_KEY.strip())
-                            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                                tmp.write(pdf_bytes)
-                                tmp_path = tmp.name
-                            try:
-                                _sub_doc_id = sdk.submit_document(tmp_path)["doc_id"]
-                            finally:
-                                try:
-                                    os.unlink(tmp_path)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            _sub_doc_id = pageindex_client.upload_doc(
-                                pdf_bytes,
-                                filename=upload_filename,
-                            )
-                    with st.spinner("Building section index (PageIndex tree); this may take a minute..."):
-                        pageindex_client.poll_until_ready(_sub_doc_id, poll_interval=5.0, max_wait=600.0)
+                cached_doc_id = supabase.get_pageindex_doc_id_by_hash(content_hash) if supabase else None
+                existing_tree = get_tree(cached_doc_id, tree_storage) if cached_doc_id else None
+                if cached_doc_id and existing_tree:
+                    _sub_doc_id = cached_doc_id
+                    st.info(f"Reusing existing submission (doc_id: {_sub_doc_id[:16]}…) — same file was uploaded before.")
+                else:
+                    with st.spinner("Building document tree from PDF (this may take a few minutes)..."):
+                        new_doc_id, _ = build_tree_with_generated_id(
+                            pdf_bytes,
+                            storage=tree_storage,
+                        )
+                    _sub_doc_id = new_doc_id
                     if supabase:
-                        supabase.save_pageindex_submission_cache(content_hash, _sub_doc_id, filename=upload_filename)
-                    st.success(f"Submission tree ready (doc_id: {_sub_doc_id})")
+                        # Cache: content_hash -> generated doc_id so we reuse the same tree next time
+                        supabase.save_pageindex_submission_cache(content_hash, new_doc_id, filename=upload_filename)
+                    st.success(f"Submission tree ready (doc_id: {_sub_doc_id[:16]}…)")
             except Exception as e:
-                st.error(f"Failed to create PageIndex tree for submission: {e}")
+                st.error(f"Failed to build document tree for submission: {e}")
                 return
         elif use_pageindex and not _sub_doc_id:
-            st.error("No submission doc_id available. Upload a PDF or enter an existing Submission doc_id.")
+            st.error("No submission available. Upload a PDF to build a tree.")
             return
 
         # PageIndex: if Reference doc_id is empty, default it to Submission doc_id (single-doc mode).
@@ -1497,7 +1473,7 @@ def show_tender_check_tab():
                 contradiction_prompt=st.session_state.tender_contradiction_prompt,
                 orchestrator_prompt=st.session_state.tender_orchestrator_prompt,
                 progress_callback=progress_callback,
-                pageindex_client=pageindex_client,
+                tree_storage=tree_storage,
             )
         except Exception as e:
             st.error(f"Failed to initialize workflow: {str(e)}")

@@ -1,10 +1,15 @@
 """PageIndex-style tree search RAG: get tree -> LLM tree search -> context -> optional answer."""
 import json
 import copy
+import time
 from typing import List, Dict, Any, Optional
 
 from clients.pageindex_client import PageIndexClient
 from clients.ai_client import AIClient
+
+# Cache for get_tree_cached: doc_id -> (tree, timestamp)
+_tree_cache: Dict[str, tuple] = {}
+_DEFAULT_TREE_CACHE_TTL_SECONDS = 3600  # 1 hour
 
 
 def get_tree(
@@ -21,6 +26,25 @@ def get_tree(
         retry_if_not_ready=retry_if_not_ready,
         max_retries=max_retries,
     )
+
+
+def get_tree_cached(
+    pi_client: PageIndexClient,
+    doc_id: str,
+    ttl_seconds: float = _DEFAULT_TREE_CACHE_TTL_SECONDS,
+    summary: bool = True,
+    retry_if_not_ready: bool = True,
+    max_retries: int = 8,
+) -> List[Dict[str, Any]]:
+    """Get tree for doc_id, using an in-memory cache to avoid re-fetching within TTL (e.g. same reference doc across runs)."""
+    now = time.time()
+    if doc_id in _tree_cache:
+        tree, cached_at = _tree_cache[doc_id]
+        if (now - cached_at) < ttl_seconds:
+            return tree
+    tree = get_tree(pi_client, doc_id, summary=summary, retry_if_not_ready=retry_if_not_ready, max_retries=max_retries)
+    _tree_cache[doc_id] = (tree, now)
+    return tree
 
 
 def _node_id_str(nid: Any) -> str:
@@ -200,9 +224,11 @@ def tree_rag_retrieve(
     doc_id: str,
     query: str,
     model: Optional[str] = None,
+    tree: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Get tree -> tree search -> return single context string (for agents or answer step)."""
-    tree = get_tree(pi_client, doc_id)
+    """Get tree (or use provided tree) -> tree search -> return single context string (for agents or answer step)."""
+    if tree is None:
+        tree = get_tree(pi_client, doc_id)
     tree_no_text = remove_tree_fields(tree, ["text"])
     node_list = tree_search_llm(ai_client, query, tree_no_text, model=model)
     node_map = build_node_map(tree)
